@@ -8,6 +8,8 @@ The infrastructure is defined in two variants — **v2** and **v3** — that dif
 
 > **Note:** Current active environments are `dev` and `staging` only.
 
+> **Note**: The microservices may increase or descrease base on the info from backend
+
 ---
 
 ## Architecture Variants
