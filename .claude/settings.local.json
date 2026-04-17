@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p final-doc)",
+      "Bash(mv doc/* final-doc/)",
+      "Bash(mv research1.md research2.md research3.md research4.md research5.md research6.md final-doc/)"
+    ]
+  }
+}
