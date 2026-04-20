@@ -1,7 +1,7 @@
 # Infrastructure & Deployment
 ## Office Management System (OMS)
 
-**Version:** 3.0 | **Platform:** AWS | **Orchestration:** ECS Fargate
+**Version:** 4.0 | **Platform:** AWS | **Orchestration:** ECS Fargate
 
 ---
 
@@ -10,35 +10,33 @@
 ```
 Internet / Corporate Network
         ↓ HTTPS / TLS 1.3
-[AWS ALB — public-facing]
-  TLS termination · HTTPS redirect · Health check routing
+[Amazon CloudFront]
+  Static asset CDN · /api/** forwarded to API Gateway
         ↓
-[Spring Cloud Gateway — 2 ECS Tasks, port 8080]
-  Session validation → auth-service (Eureka)
-  Route: lb://service-name (Eureka resolution)
-  Rate limiting → Redis (ElastiCache)
-  Correlation ID injection
-        ↓ HTTPS internal (VPC private subnets)
+[AWS API Gateway HTTP API]
+  Lambda Authorizer: SESSION cookie → auth-service → internal JWT
+  VPC Link: routes to ECS via Cloud Map DNS
+  CORS · Rate limiting (Usage Plans) · Correlation ID injection
+        ↓ VPC Link (private subnets)
 ┌────────────────────────────────────────────────┐
 │           ECS Cluster: oms-cluster              │
 │                                                 │
-│  eureka-server        (2 tasks — HA)  :8761    │
 │  auth-service         (2–10 tasks)    :8081    │
-│  attendance-service   (2–6 tasks)     :8083    │
+│  attendance-service   (2–6 tasks)     :8083    │  ← FastAPI / Python 3.12
 │  seating-service      (2–10 tasks)    :8084    │
 │  remote-service       (2–6 tasks)     :8085    │
-│  notification-service (2–6 tasks)     :8086    │
+│  notification-service (2–6 tasks)     :8086    │  ← FastAPI / Python 3.12
 │  audit-service        (2–8 tasks)     :8087    │
-│  inventory-service    (2–6 tasks)     :8090    │ ← Phase 2
-│  workplace-service    (2–6 tasks)     :8088    │ ← Phase 2
+│  inventory-service    (2–6 tasks)     :8090    │  ← Phase 2
+│  workplace-service    (2–6 tasks)     :8088    │  ← Phase 2
 └──────────────┬────────────────────────────────┘
-               │
+               │ Cloud Map DNS (oms.local)
    ┌───────────┼──────────────────┐
    │           │                  │
-Amazon MQ   AWS RDS           AWS S3
-RabbitMQ    PostgreSQL        audit archival
-active/     8 isolated        >24 months
-standby     instances         Glacier IR
+Amazon SNS   AWS RDS           AWS S3
++ SQS        PostgreSQL        audit archival
+(replaces MQ) 8 isolated        >24 months
+             instances         Glacier IR
 ```
 
 ---
@@ -47,17 +45,23 @@ standby     instances         Glacier IR
 
 | Service | Purpose | Configuration |
 |---|---|---|
-| **ECS Fargate** | Container orchestration | `oms-cluster`, 8 services + gateway + Eureka |
-| **ALB** | Public-facing load balancer | HTTPS :443 → gateway :8080 |
-| **Amazon MQ** | RabbitMQ broker | Active/standby, `mq.m5.large`, multi-AZ |
+| **ECS Fargate** | Container orchestration | `oms-cluster`, 8 services |
+| **AWS API Gateway HTTP API** | Public-facing API routing + auth | Lambda Authorizer, VPC Link, Usage Plans |
+| **Amazon CloudFront** | CDN + React SPA delivery | Cache SPA assets; forward /api/** to API Gateway |
+| **AWS Lambda** | Lambda Authorizer | Python 3.12; calls auth-service; 300s cache |
+| **AWS Cloud Map** | Service discovery | `oms.local` private DNS; A records, 10s TTL |
+| **Amazon SNS** | Async event fanout | 6 topics: oms-user, oms-attendance, oms-seating, oms-remote, oms-inventory, oms-audit |
+| **Amazon SQS** | Async message queuing per consumer | One queue per consumer per topic; DLQ via Terraform RedrivePolicy (maxReceiveCount=3) |
+| **Amazon SES** | Transactional email | notification-service only; eu-west-1 |
 | **AWS RDS** | PostgreSQL databases | 8 instances, `db.t3.small`, Multi-AZ |
 | **ECR** | Docker image registry | One repository per service |
-| **Secrets Manager** | Runtime secrets injection | DB passwords, JWT key, RabbitMQ credentials |
-| **ElastiCache (Redis)** | Gateway rate-limiting state | `cache.t3.micro`, single-node |
+| **Secrets Manager** | Runtime secrets injection | DB passwords, JWT key, SSO client secret |
 | **S3** | Audit log archival | Glacier Instant Retrieval |
 | **CloudWatch Logs** | Centralised log aggregation | `/oms/{service-name}` log group per service |
-| **Certificate Manager** | TLS certificates | ALB HTTPS termination |
-| **VPC** | Network isolation | Private subnets for all services; public subnet for ALB only |
+| **CloudWatch Metrics + Alarms** | Metrics + alerting | Container Insights; custom metrics; DLQ depth alarms |
+| **Certificate Manager** | TLS certificates | CloudFront + API Gateway HTTPS |
+| **VPC + VPC Link** | Network isolation | Private subnets for ECS; VPC Link bridges API GW → ECS |
+| **AWS WAF** | Edge security | OWASP Core Rule Set on API Gateway |
 
 ---
 
@@ -75,6 +79,7 @@ Every service shares the same pattern. Differences are in image name, port, CPU/
   "cpu": "256",
   "memory": "512",
   "executionRoleArn": "arn:aws:iam::ACCOUNT:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT:role/ecsTaskRole-seating",
   "containerDefinitions": [
     {
       "name": "seating-service",
@@ -82,14 +87,14 @@ Every service shares the same pattern. Differences are in image name, port, CPU/
       "portMappings": [{ "containerPort": 8084, "protocol": "tcp" }],
       "environment": [
         { "name": "SPRING_PROFILES_ACTIVE", "value": "prod" },
-        { "name": "EUREKA_CLIENT_SERVICEURL_DEFAULTZONE", "value": "http://eureka.oms.internal:8761/eureka/" },
-        { "name": "RABBITMQ_HOST", "value": "b-xxx.mq.eu-west-1.amazonaws.com" },
-        { "name": "BOOKING_WINDOW_DAYS", "value": "14" },
-        { "name": "NO_SHOW_RELEASE_CRON", "value": "0 10 * * *" }
+        { "name": "AUTH_SERVICE_URL", "value": "http://auth-service.oms.local:8081" },
+        { "name": "AWS_REGION", "value": "eu-west-1" },
+        { "name": "SNS_TOPIC_ARN_SEATING", "value": "arn:aws:sns:eu-west-1:ACCOUNT:oms-seating" },
+        { "name": "SQS_QUEUE_URL_NOTIFICATIONS", "value": "https://sqs.eu-west-1.amazonaws.com/ACCOUNT/oms-notifications-queue" },
+        { "name": "BOOKING_WINDOW_DAYS", "value": "14" }
       ],
       "secrets": [
         { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-1:ACCOUNT:secret:oms/seating/db-password" },
-        { "name": "RABBITMQ_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-1:ACCOUNT:secret:oms/rabbitmq/password" },
         { "name": "INTERNAL_JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:eu-west-1:ACCOUNT:secret:oms/internal-jwt-secret" }
       ],
       "healthCheck": {
@@ -112,20 +117,34 @@ Every service shares the same pattern. Differences are in image name, port, CPU/
 }
 ```
 
+> **Note:** ECS registers tasks with Cloud Map automatically via `serviceRegistries` in the ECS Service definition (not the task definition). The Terraform snippet below shows this pattern:
+
+```hcl
+resource "aws_ecs_service" "seating" {
+  name            = "seating-service"
+  cluster         = aws_ecs_cluster.oms.id
+  task_definition = aws_ecs_task_definition.seating.arn
+  desired_count   = 2
+
+  service_registries {
+    registry_arn = aws_service_discovery_service.seating.arn
+  }
+  ...
+}
+```
+
 ### CPU and Memory Per Service
 
 | Service | CPU | Memory | Reason |
 |---|---|---|---|
-| `api-gateway` | 512 | 1024 MB | All traffic passes through; higher load |
-| `eureka-server` | 256 | 512 MB | Registry only; low compute |
-| `auth-service` | 256 | 512 MB | Stateless JWT validation; low compute |
-| `attendance-service` | 512 | 1024 MB | Nightly batch job is CPU/memory intensive |
+| `auth-service` | 256 | 512 MB | Stateless JWT validation; moderate load |
+| `attendance-service` | 512 | 1024 MB | FastAPI; nightly batch job CPU/memory intensive |
 | `seating-service` | 256 | 512 MB | Real-time queries; moderate |
 | `remote-service` | 256 | 512 MB | Policy engine; moderate |
-| `notification-service` | 256 | 512 MB | Kafka consumer + email dispatch |
+| `notification-service` | 256 | 512 MB | FastAPI; SQS consumer + SES dispatch |
 | `audit-service` | 256 | 512 MB | High write volume; append-only |
-| `inventory-service` | 256 | 512 MB | Phase 2; similar to remote |
-| `workplace-service` | 256 | 512 MB | Phase 2; low compute |
+| `inventory-service` | 256 | 512 MB | Phase 2 |
+| `workplace-service` | 256 | 512 MB | Phase 2 |
 
 ---
 
@@ -141,7 +160,6 @@ Scale-out cooldown: 60s
 Scale-in cooldown: 300s
 
 Per-service limits:
-  api-gateway:          min 2, max 8
   auth-service:         min 2, max 10
   attendance-service:   min 2, max 6 (+ scheduled scale-up before nightly sync)
   seating-service:      min 2, max 10
@@ -163,16 +181,16 @@ The nightly badge sync job runs at 02:00 UTC. Pre-scaling ensures compute is ava
 
 ## 5. Networking and Security Groups
 
-All services run in **private subnets**. Only the ALB is in a public subnet.
+All services run in **private subnets**. VPC Link ENIs also reside in private subnets; there are no public-facing load balancers.
 
 ```
 VPC: 10.0.0.0/16
 
-Public subnets (ALB only):
+Public subnets (no ALB — VPC Link ENIs are in private subnets):
   10.0.1.0/24  eu-west-1a
   10.0.2.0/24  eu-west-1b
 
-Private subnets (all ECS tasks + RDS + Amazon MQ):
+Private subnets (all ECS tasks + RDS + VPC Link ENIs):
   10.0.10.0/24  eu-west-1a
   10.0.11.0/24  eu-west-1b
   10.0.12.0/24  eu-west-1c
@@ -182,43 +200,41 @@ Private subnets (all ECS tasks + RDS + Amazon MQ):
 
 | Security Group | Inbound | Outbound |
 |---|---|---|
-| `sg-alb` | 443 from 0.0.0.0/0 | 8080 to `sg-gateway` |
-| `sg-gateway` | 8080 from `sg-alb` | 8081–8091 to `sg-services` |
-| `sg-services` | 8081–8091 from `sg-gateway` + `sg-services` | 5432 to `sg-rds`, 5671 to `sg-mq`, 8761 to `sg-eureka` |
-| `sg-eureka` | 8761 from `sg-services` + `sg-gateway` | — |
+| `sg-apigw-vpclink` | Managed by API Gateway VPC Link | 8081–8091 to `sg-services` |
+| `sg-services` | 8081–8091 from `sg-apigw-vpclink` + `sg-services` (inter-service) | 5432 to `sg-rds`; 443 to SNS/SQS/SES endpoints |
 | `sg-rds` | 5432 from matching `sg-services` only | — |
-| `sg-mq` | 5671 from `sg-services` | — |
-| `sg-elasticache` | 6379 from `sg-gateway` | — |
+| `sg-lambda` | — | 443 to `sg-services` (Lambda Authorizer → auth-service) |
 
-Each service's security group only allows inbound from specific other service groups — no `sg-services` allows blanket access to all ports.
+Each service's security group only allows inbound from specific other security groups — no group grants blanket access across all ports.
 
 ---
 
-## 6. Amazon MQ (RabbitMQ) Configuration
+## 6. Amazon SNS + SQS Configuration
 
 ```
-Deployment mode: ACTIVE_STANDBY_MULTI_AZ
-Broker instance type: mq.m5.large
-Engine version: RabbitMQ 3.12.x
-Public accessibility: false (VPC-only)
-TLS: enabled (port 5671)
-Auto minor version upgrades: true
-Maintenance window: Sunday 03:00–05:00 UTC
+SNS Topics (6 total):
+  oms-user, oms-attendance, oms-seating, oms-remote, oms-inventory, oms-audit
+  All: Standard type (not FIFO); eu-west-1
 
-Virtual host: /oms
+SQS Queues:
+  Naming: oms-{topic}-{consumer-service}
+  e.g.: oms-remote-attendance-service
+         oms-remote-notification-service
+         oms-remote-audit-service
 
-Exchanges (Topic type):
-  oms.user, oms.attendance, oms.seating, oms.remote,
-  oms.visitor, oms.event, oms.inventory, oms.audit
-  oms.dlx (dead-letter exchange)
+All queues:
+  Visibility timeout: 30s
+  Message retention: 4 days
+  Long polling: WaitTimeSeconds=20 (set at consumer)
 
-Queue naming: {exchange}.{consumer-service}
-  e.g., oms.remote.attendance-service
-        oms.remote.notification-service
-        oms.remote.audit-service
+DLQ per queue:
+  Name: {queue-name}-dlq
+  Configured via Terraform aws_sqs_queue_redrive_policy
+  maxReceiveCount: 3
 
-All queues: durable=true, autoDelete=false
-All queues: x-dead-letter-exchange=oms.dlx
+SNS → SQS subscription filter policy (example):
+  oms-remote → oms-remote-attendance-service:
+  { "eventType": ["request.approved", "ooo.request.approved"] }
 ```
 
 ---
@@ -248,31 +264,51 @@ Database users (per service):
 
 ## 8. CI/CD Pipeline
 
-Each service has an independent GitHub Actions pipeline. Deploying `seating-service` never affects `attendance-service`.
+Each service has an independent Jenkins pipeline. Deploying `seating-service` never affects `attendance-service`.
 
 ```
 Trigger: Pull Request opened / updated
          Push to develop, staging, main
 
-Pipeline steps:
-  1. Lint (Checkstyle — Google Java Style)
-  2. Unit tests (JUnit 5 + Mockito)
-  3. Integration tests (Spring Boot Test + TestContainers)
-     → Real PostgreSQL container
-     → Real RabbitMQ container
-  4. Pact consumer contract tests
-  5. OWASP Dependency Check (fail on CVSS >= 7)
-  6. Docker build (multi-stage)
-  7. Docker push to ECR (on merge only)
-  8. Pact provider verification (on push to staging branch)
+Jenkins pipeline (Jenkinsfile — same structure for all services):
 
-Environments:
-  develop → auto-deploy to DEV
-  staging → auto-deploy to STAGING + Pact provider verify
-  main    → manual approval gate → PRODUCTION + rollback plan documented
+pipeline {
+  agent any
+  environment {
+    ECR_REGISTRY = 'ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com'
+    SERVICE_NAME = 'seating-service'
+    AWS_REGION = 'eu-west-1'
+  }
+  stages {
+    stage('Lint') { steps { sh './mvnw checkstyle:check' } }
+    stage('Test') { steps { sh './mvnw test' } }
+    stage('OWASP') { steps { sh './mvnw org.owasp:dependency-check-maven:check -Dfail.build.on.cvss=7' } }
+    stage('Docker Build') {
+      steps {
+        sh 'docker build -t $ECR_REGISTRY/oms/$SERVICE_NAME:$BUILD_NUMBER .'
+      }
+    }
+    stage('Push to ECR') {
+      when { branch 'main' }
+      steps {
+        sh 'aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REGISTRY'
+        sh 'docker push $ECR_REGISTRY/oms/$SERVICE_NAME:$BUILD_NUMBER'
+      }
+    }
+    stage('Deploy to ECS') {
+      when { branch 'main' }
+      steps {
+        sh '''
+          aws ecs update-service --cluster oms-cluster --service $SERVICE_NAME --force-new-deployment --region $AWS_REGION
+          aws ecs wait services-stable --cluster oms-cluster --services $SERVICE_NAME
+        '''
+      }
+    }
+  }
+}
 ```
 
-### Dockerfile (all services — same template)
+### Dockerfile — Spring Boot Services
 
 ```dockerfile
 # Stage 1: Build
@@ -295,19 +331,22 @@ ENTRYPOINT ["java", \
   "-jar", "app.jar"]
 ```
 
-### ECS Deployment Step (GitHub Actions)
+### Dockerfile — FastAPI Services (attendance-service, notification-service)
 
-```yaml
-- name: Deploy to ECS
-  run: |
-    aws ecs update-service \
-      --cluster oms-cluster \
-      --service ${{ env.SERVICE_NAME }} \
-      --force-new-deployment \
-      --region eu-west-1
-    aws ecs wait services-stable \
-      --cluster oms-cluster \
-      --services ${{ env.SERVICE_NAME }}
+```dockerfile
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.12-slim
+RUN addgroup --system oms && adduser --system --ingroup oms oms
+USER oms
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.12 /usr/local/lib/python3.12
+COPY . .
+EXPOSE 8083
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8083", "--workers", "2"]
 ```
 
 ---
@@ -316,18 +355,19 @@ ENTRYPOINT ["java", \
 
 | Component | Strategy | RTO | RPO |
 |---|---|---|---|
-| RDS | Multi-AZ + daily snapshots + PITR | < 30 min (failover) | < 24 hours (daily snapshot) |
-| Amazon MQ | Active/standby multi-AZ | < 2 min (AWS-managed failover) | Zero (messages in durable queues survive) |
-| ECS | Multi-AZ task placement; ALB health-check-driven | < 5 min (tasks restart automatically) | Zero (stateless) |
-| S3 (audit archival) | Standard S3 durability (11 nines) | Immediate | Zero |
-| ECR (Docker images) | AWS-managed; multi-AZ | Immediate | Zero |
+| RDS | Multi-AZ + daily snapshots + PITR | < 30 min | < 24 hours |
+| SQS | AWS-managed; multi-AZ; messages retained 4 days | Immediate | Zero (at-least-once delivery) |
+| ECS | Multi-AZ task placement; API GW health-check-driven | < 5 min | Zero (stateless) |
+| S3 (audit archival) | Standard S3 durability | Immediate | Zero |
+| ECR | AWS-managed; multi-AZ | Immediate | Zero |
+| API Gateway | AWS-managed; multi-AZ; 99.99% SLA | Immediate | Zero |
 
 ---
 
 ## 10. Environment Summary
 
-| Environment | Purpose | Deployment | RDS | MQ |
-|---|---|---|---|---|
-| `dev` | Active development | Auto on `develop` merge | Single-AZ, db.t3.micro | Single broker |
-| `staging` | Pre-production, Pact verify | Auto on `staging` merge | Single-AZ, db.t3.small | Single broker |
-| `production` | Live system | Manual gate from `main` | Multi-AZ, db.t3.small | Active/standby |
+| Environment | Purpose | Deployment | RDS |
+|---|---|---|---|
+| `dev` | Active development | Auto on `develop` merge | Single-AZ, db.t3.micro |
+| `staging` | Pre-production | Auto on `staging` merge | Single-AZ, db.t3.small |
+| `production` | Live system | Manual gate from `main` | Multi-AZ, db.t3.small |

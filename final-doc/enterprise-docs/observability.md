@@ -1,7 +1,7 @@
 # Observability
 ## Office Management System (OMS)
 
-**Version:** 3.0 | Logs: CloudWatch | Metrics: Prometheus + Grafana | Traces: OpenTelemetry + Jaeger
+**Version:** 4.0 | Logs: CloudWatch | Metrics: Prometheus + Grafana | Traces: OpenTelemetry + Jaeger
 
 ---
 
@@ -13,7 +13,14 @@ Every Spring Boot service
     ↓ /actuator/prometheus            → Prometheus (scrapes every 15s)
     ↓ OpenTelemetry SDK (traces)      → Jaeger (via OTel Collector)
     ↓ /actuator/health/liveness       → ECS task health check
-    ↓ /actuator/health/readiness      → ALB target group health check
+    ↓ /actuator/health/readiness      → API Gateway VPC Link health check
+
+Every FastAPI service (attendance, notification)
+    ↓ stdout (structured JSON)        → CloudWatch Logs
+    ↓ /metrics (prometheus_client)    → Prometheus (scrapes every 15s)
+    ↓ OpenTelemetry SDK (traces)      → Jaeger (via OTel Collector)
+    ↓ /health/liveness                → ECS task health check
+    ↓ /health/readiness               → API Gateway VPC Link health check
 
 Prometheus → Grafana (dashboards + alerting)
 CloudWatch → CloudWatch Alarms + PagerDuty / Slack
@@ -55,7 +62,7 @@ All services output structured JSON to stdout. The ECS `awslogs` driver ships lo
 - Log at appropriate levels: INFO for business events, WARN for degraded fallbacks, ERROR for exceptions
 - All mutations log: actor, action, entity type, entity ID, location
 
-### Logback Configuration (logback-spring.xml)
+### Logback Configuration — Spring Boot (logback-spring.xml)
 
 ```xml
 <configuration>
@@ -77,11 +84,36 @@ All services output structured JSON to stdout. The ECS `awslogs` driver ships lo
 </configuration>
 ```
 
+### structlog Configuration — FastAPI / Python 3.12
+
+```python
+import structlog, logging
+
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+)
+logger = structlog.get_logger()
+
+# Usage
+logger.info("SEAT_BOOKED",
+    user_id=str(user_id),
+    seat_id=str(seat_id),
+    correlation_id=correlation_id,
+    location_id=str(location_id),
+    duration_ms=elapsed)
+```
+
 ---
 
 ## 3. Metrics (Prometheus + Grafana)
 
-Every service exposes `/actuator/prometheus`. Prometheus scrapes all services every 15 seconds.
+Every service exposes `/actuator/prometheus` (Spring Boot) or `/metrics` (FastAPI). Prometheus scrapes all services every 15 seconds.
 
 ### Key Metrics Per Service
 
@@ -91,7 +123,7 @@ http_server_requests_seconds_count{method, uri, status}   — request count
 http_server_requests_seconds_sum{method, uri, status}      — total duration
 http_server_requests_seconds_max{method, uri}              — max latency (p99 proxy)
 
-# JVM
+# JVM (Spring Boot services)
 jvm_memory_used_bytes{area}                               — heap / non-heap usage
 jvm_gc_pause_seconds_count                                — GC frequency
 
@@ -99,14 +131,16 @@ jvm_gc_pause_seconds_count                                — GC frequency
 hikaricp_connections_active{pool}                         — active DB connections
 hikaricp_connections_pending{pool}                        — queued DB requests
 
-# RabbitMQ consumers
-spring_rabbitmq_listener_seconds_count{listener_id}       — messages processed
-spring_rabbitmq_listener_seconds_sum{listener_id}         — total consumer time
+# SQS consumers (custom — published via Micrometer / prometheus_client)
+oms_sqs_messages_processed_total{queue, service}          — messages successfully processed
+oms_sqs_messages_failed_total{queue, service}             — messages failed (routed to DLQ)
+oms_sqs_consumer_duration_seconds{queue, service}         — per-message processing time
 
-# RabbitMQ queue depth (via RabbitMQ Prometheus plugin via Amazon MQ)
-rabbitmq_queue_messages{queue}                            — messages waiting
+# SQS queue depth (scraped from CloudWatch via prometheus-cloudwatch-exporter)
+aws_sqs_approximate_number_of_messages_visible{queue_name}   — messages waiting
+aws_sqs_approximate_number_of_messages_not_visible{queue_name} — in-flight messages
 
-# Circuit breakers
+# Circuit breakers (Spring Boot — Resilience4j)
 resilience4j_circuitbreaker_state{name}                   — CLOSED/OPEN/HALF_OPEN
 resilience4j_circuitbreaker_failure_rate{name}            — failure percentage
 
@@ -116,7 +150,33 @@ oms_badge_sync_last_success_timestamp                     — last successful ru
 oms_no_show_release_duration_seconds                      — no-show job duration
 ```
 
-### Custom Business Metrics (Micrometer)
+### FastAPI Prometheus Metrics (prometheus_client)
+
+```python
+from prometheus_client import Counter, Histogram, make_asgi_app
+from fastapi import FastAPI
+
+REQUEST_COUNT = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["method", "endpoint", "status_code"],
+)
+REQUEST_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request duration",
+    ["method", "endpoint"],
+)
+SQS_PROCESSED = Counter(
+    "oms_sqs_messages_processed_total",
+    "SQS messages processed",
+    ["queue", "service"],
+)
+
+app = FastAPI()
+app.mount("/metrics", make_asgi_app())  # Prometheus scrape endpoint
+```
+
+### Custom Business Metrics — Spring Boot (Micrometer)
 
 ```java
 // attendance-service — badge sync job
@@ -141,7 +201,7 @@ public void runBadgeSync(UUID locationId) {
 
 ## 4. Distributed Tracing (OpenTelemetry + Jaeger)
 
-### Configuration (all services — application.yml)
+### Configuration — Spring Boot (application.yml)
 
 ```yaml
 management:
@@ -159,7 +219,7 @@ spring:
 # OTEL_TRACES_EXPORTER=otlp
 ```
 
-### pom.xml dependency
+### pom.xml dependencies
 
 ```xml
 <dependency>
@@ -172,17 +232,44 @@ spring:
 </dependency>
 ```
 
+### Configuration — FastAPI / Python 3.12
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+
+provider = TracerProvider()
+provider.add_span_processor(
+    BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.OTEL_EXPORTER_OTLP_ENDPOINT))
+)
+trace.set_tracer_provider(provider)
+
+FastAPIInstrumentor.instrument_app(app)
+SQLAlchemyInstrumentor().instrument()
+```
+
+Environment variables (ECS Task Definition):
+```
+OTEL_SERVICE_NAME=attendance-service
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+OTEL_TRACES_EXPORTER=otlp
+```
+
 ### Trace Flow
 
 ```
 Browser → GET /api/v1/seat-bookings  [traceId: abc123]
-    → Gateway: X-Correlation-ID: req-456  [spanId: 0001]
+    → API Gateway Lambda Authorizer: X-Correlation-ID: req-456  [spanId: 0001]
     → seating-service                     [spanId: 0002, parent: 0001]
-        → Feign: GET auth-service/users   [spanId: 0003, parent: 0002]
-        → DB: SELECT seat_bookings        [spanId: 0004, parent: 0002]
-        → RabbitMQ publish: booking.created [spanId: 0005, parent: 0002]
-    → notification-service consumer       [spanId: 0006, parent: 0005]
-    → audit-service consumer              [spanId: 0007, parent: 0005]
+        → WebClient: GET auth-service/users   [spanId: 0003, parent: 0002]
+        → DB: SELECT seat_bookings            [spanId: 0004, parent: 0002]
+        → SNS publish: booking.created        [spanId: 0005, parent: 0002]
+    → notification-service SQS consumer      [spanId: 0006, parent: 0005]
+    → audit-service SQS consumer             [spanId: 0007, parent: 0005]
 
 Jaeger: search traceId=abc123 → see complete waterfall
 ```
@@ -191,7 +278,7 @@ Jaeger: search traceId=abc123 → see complete waterfall
 
 ## 5. Health Checks
 
-Every service exposes Spring Actuator liveness and readiness endpoints.
+### Spring Boot Actuator
 
 ```yaml
 management:
@@ -209,16 +296,31 @@ management:
       enabled: true
     readinessstate:
       enabled: true
-    rabbitmq:
-      enabled: true
     db:
       enabled: true
 ```
 
+### FastAPI Health Endpoints
+
+```python
+from fastapi import FastAPI, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+
+@app.get("/health/liveness")
+async def liveness():
+    return {"status": "ok"}
+
+@app.get("/health/readiness")
+async def readiness(db: AsyncSession = Depends(get_db)):
+    await db.execute(text("SELECT 1"))
+    return {"status": "ok", "db": "connected"}
+```
+
 | Probe | Endpoint | Checks | Used By |
 |---|---|---|---|
-| Liveness | `/actuator/health/liveness` | Is JVM running? Any deadlock? | ECS task restart policy |
-| Readiness | `/actuator/health/readiness` | DB connected? RabbitMQ connected? Eureka registered? | ALB target group (removes unhealthy tasks from rotation) |
+| Liveness | `/actuator/health/liveness` (Spring) / `/health/liveness` (FastAPI) | Is process running? Any deadlock? | ECS task restart policy |
+| Readiness | `/actuator/health/readiness` (Spring) / `/health/readiness` (FastAPI) | DB connected? SQS reachable? | API Gateway VPC Link (removes unhealthy tasks from rotation) |
 
 ECS Task Definition health check:
 ```json
@@ -241,32 +343,34 @@ ECS Task Definition health check:
 |---|---|---|
 | Badge sync job failure | `oms_badge_sync_last_success_timestamp` > 26h ago | No attendance data for the day |
 | Service error rate high | HTTP 5xx rate > 1% for 5 minutes | User-facing errors |
+| SQS DLQ depth > 0 | `aws_sqs_approximate_number_of_messages_visible{queue=*-dlq}` ≥ 1 | Failed message processing |
 | Circuit breaker OPEN | `resilience4j_circuitbreaker_state == OPEN` | Service degraded |
-| ECS task unhealthy | ALB target health check failing on all tasks | Service unavailable |
+| ECS task unhealthy | API Gateway VPC Link health check failing on all tasks | Service unavailable |
 | RDS connection failure | `hikaricp_connections_pending > 10` for 2+ minutes | DB saturation |
 
 ### Warning Alerts (Slack)
 
 | Alert | Condition | Impact |
 |---|---|---|
-| RabbitMQ queue depth high | Any queue depth > 10,000 messages | Consumer falling behind |
+| SQS queue depth high | Any non-DLQ queue `aws_sqs_approximate_number_of_messages_visible > 500` | Consumer falling behind |
 | No-show release job failure | Job exit code != 0 | Seats not released; employee impact next morning |
-| Memory pressure | `jvm_memory_used_bytes` > 85% of limit for 5 minutes | Risk of OOM restart |
+| Memory pressure | `jvm_memory_used_bytes` > 85% of limit for 5 minutes (Spring) / process memory > 85% (FastAPI) | Risk of OOM restart |
 | DB connection pool near saturation | `hikaricp_connections_active` > 80% of max | Approaching bottleneck |
 | ECS task restart > 3 times | Restart count in 1 hour > 3 | Crash loop risk |
 
-### CloudWatch Alarm Configuration (example)
+### CloudWatch Alarm Configuration (SQS DLQ example)
 
 ```json
 {
-  "AlarmName": "oms-badge-sync-failure",
-  "MetricName": "oms_badge_sync_last_success_timestamp",
-  "Namespace": "OMS/AttendanceService",
-  "Statistic": "Maximum",
-  "Period": 3600,
+  "AlarmName": "oms-remote-attendance-dlq-depth",
+  "MetricName": "ApproximateNumberOfMessagesVisible",
+  "Namespace": "AWS/SQS",
+  "Dimensions": [{"Name": "QueueName", "Value": "oms-remote-attendance-service-dlq"}],
+  "Statistic": "Sum",
+  "Period": 60,
   "EvaluationPeriods": 1,
-  "Threshold": 93600,
-  "ComparisonOperator": "LessThanThreshold",
+  "Threshold": 1,
+  "ComparisonOperator": "GreaterThanOrEqualToThreshold",
   "AlarmActions": ["arn:aws:sns:eu-west-1:ACCOUNT:oms-pagerduty"]
 }
 ```
@@ -279,7 +383,7 @@ ECS Task Definition health check:
 |---|---|
 | **System Overview** | HTTP request rate, p95 latency, 5xx error rate — all services |
 | **Service Detail** | Per-service: request rate, latency histogram, DB connections, JVM heap |
-| **Kafka / RabbitMQ** | Queue depth per queue, consumer throughput, DLQ message count |
+| **SQS Health** | Queue depth per queue (`aws_sqs_approximate_number_of_messages_visible`), DLQ message count, consumer throughput (`oms_sqs_messages_processed_total`) |
 | **Circuit Breakers** | State per service (CLOSED/OPEN/HALF_OPEN), failure rate |
 | **Nightly Jobs** | Badge sync duration, last success time, no-show release duration |
 | **ECS Health** | Task count per service, restart count, CPU/memory utilisation |

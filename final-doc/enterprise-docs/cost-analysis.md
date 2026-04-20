@@ -1,7 +1,7 @@
 # Cost Analysis and Optimisation
 ## Office Management System (OMS)
 
-**Version:** 3.0 | Scale: 2–5 locations, hundreds of employees
+**Version:** 4.0 | Scale: 2–5 locations, hundreds of employees
 
 ---
 
@@ -9,45 +9,47 @@
 
 | Component | Service | Instance/Config | Est. Monthly |
 |---|---|---|---|
-| Container orchestration | ECS Fargate | 8 services + gateway + Eureka, avg 2 tasks × 0.25 vCPU × 0.5 GB | **~$80–150** |
-| Message broker | Amazon MQ (RabbitMQ) | `mq.m5.large` active/standby multi-AZ | **~$230** |
+| Container orchestration | ECS Fargate | 8 services, avg 2 tasks × 0.25 vCPU × 0.5 GB | **~$60–100** |
+| API routing + auth | AWS API Gateway HTTP API | ~100K req/day + Lambda Authorizer (300s cache) | **~$3–8** |
+| CDN + SPA delivery | Amazon CloudFront | ~50 GB/month transfer; SPA static assets | **~$5–15** |
+| Service discovery | AWS Cloud Map | 8 service records, 10s TTL | **~$1** |
+| Async messaging | Amazon SNS + SQS | ~2,500 msgs/day; 8 SQS queues; DLQs | **~$0.40** |
 | Databases | AWS RDS PostgreSQL | 8 × `db.t3.small` Multi-AZ, 20 GB each | **~$300–480** |
-| API Gateway (ALB) | AWS ALB | 2 LCUs baseline | **~$20–35** |
-| Service discovery | Eureka Server (ECS Fargate) | 2 tasks, 0.25 vCPU, 512 MB | **~$10** |
-| Rate limiting cache | ElastiCache Redis | `cache.t3.micro`, single node | **~$15** |
+| Email | Amazon SES | ~500 emails/month (notifications) | **~$1** |
 | Audit archival | S3 Glacier Instant Retrieval | ~50 GB/year | **~$5–10** |
-| Container registry | AWS ECR | 10 repositories, ~2 GB each | **~$2** |
-| Observability | CloudWatch Logs | ~10 GB/month log ingestion | **~$5–15** |
-| Secrets | AWS Secrets Manager | 20 secrets × $0.40/secret/month | **~$8** |
+| Container registry | AWS ECR | 8 repositories, ~2 GB each | **~$2** |
+| Log aggregation | CloudWatch Logs | ~10 GB/month log ingestion | **~$5–15** |
+| Metrics | Prometheus + Grafana (ECS Fargate) | 2 tasks, 0.5 vCPU each | **~$20** |
 | Tracing | Jaeger (ECS Fargate) | 1 task, 0.5 vCPU, 1 GB | **~$15** |
-| Metrics | Prometheus + Grafana (ECS) | 2 tasks, 0.5 vCPU each | **~$20** |
-| **Total (estimated)** | | | **~$710–970/month** |
+| Secrets | AWS Secrets Manager | 20 secrets × $0.40/secret/month | **~$8** |
+| Edge security | AWS WAF | API Gateway WAF — 1 WebACL + OWASP rules | **~$10** |
+| Lambda (authorizer) | AWS Lambda | ~600K invocations/month (with 300s cache) | **~$1–2** |
+| **Total (estimated)** | | | **~$450–690/month** |
 
 *Costs are indicative. Actual costs depend on traffic volume and right-sizing after load testing.*
 
+Note: CloudFront replaces the public ALB. API Gateway HTTP API is ~70% cheaper than REST API. ECS has 2 fewer permanent services (no gateway/eureka containers).
+
 ---
 
-## 2. Broker Cost Comparison (Key Decision)
+## 2. Broker Cost Decision (Updated)
 
 The message broker was the largest infrastructure decision by cost.
 
 | Broker | AWS Service | Monthly Cost | Notes |
 |---|---|---|---|
-| Apache Kafka | AWS MSK | **~$463/month** | 3 × `kafka.m5.large` brokers, minimum HA |
-| **RabbitMQ** | **Amazon MQ** | **~$230/month** | Active/standby `mq.m5.large` |
-| SQS + SNS | Amazon SQS | **~$0.09/month** | At ~2,500 msgs/day; near-zero |
+| Apache Kafka | AWS MSK | ~$463/month | 3 × `kafka.m5.large`, minimum HA |
+| RabbitMQ | Amazon MQ | ~$230/month | Active/standby `mq.m5.large` |
+| **SQS + SNS** | **Amazon SQS** | **~$0.40/month** | At ~2,500 msgs/day; near-zero |
 
-**Why not SQS despite the cost advantage:**
-- SQS has no native Spring Cloud Stream binder — breaks the Spring Cloud ecosystem consistency
-- Fan-out requires SNS + 3 SQS queues per event type → ~45 queues for 15 event types
-- Each SQS consumer is a separate queue to monitor, configure DLQs for, and manage IAM permissions on
+**Decision for v4.0: SNS + SQS.** Previous concern was "no Spring Cloud Stream binder" — resolved by accepting polyglot messaging: FastAPI services use aioboto3 directly, Spring Boot services use AWS SDK v2 SnsClient/SqsClient. Fan-out pattern (publish once → multiple queues) is solved natively by SNS → multiple SQS subscriptions.
+
+**Annual saving from switching RabbitMQ → SNS+SQS: ~$2,748/year**
 
 **Why not Kafka despite its capabilities:**
 - Replay capability (Kafka's primary advantage over RabbitMQ) is not required at OMS scale
 - Operational overhead: partition strategy, consumer group offset management, Schema Registry
-- 50% more expensive than RabbitMQ for equivalent HA ($463 vs $230/month)
-
-**Annual savings from choosing RabbitMQ over Kafka: ~$2,796/year**
+- Over 1,000× more expensive than SNS+SQS for equivalent HA ($463 vs $0.40/month)
 
 ---
 
@@ -58,13 +60,13 @@ The message broker was the largest infrastructure decision by cost.
 | AWS EKS | **~$75** (control plane) + EC2 nodes | Plus ~$200–400 for 2 t3.medium nodes |
 | **AWS ECS Fargate** | **$0** control plane | Pay per task CPU/memory second |
 
-**ECS Fargate container cost estimate:**
-- 10 services × 2 tasks each = 20 tasks
+**ECS Fargate container cost estimate (v4.0):**
+- 8 services × 2 tasks + Prometheus + Grafana + Jaeger = ~19 tasks (vs 22 in v3.0 — no gateway/eureka ECS services)
 - Average: 0.25 vCPU × 0.5 GB RAM per task
 - Fargate: $0.04048/vCPU-hour + $0.004445/GB-hour
-- 20 tasks × 0.25 vCPU × 730 hours = ~$148/month CPU
-- 20 tasks × 0.5 GB × 730 hours = ~$32/month memory
-- **Total: ~$180/month** (vs EKS ~$300–475/month)
+- 19 tasks × 0.25 vCPU × 730 hours = ~$140/month CPU
+- 19 tasks × 0.5 GB × 730 hours = ~$31/month memory
+- **Total: ~$171/month** (down from ~$180/month — 2 fewer ECS services: gateway + eureka)
 
 **Annual savings from choosing ECS over EKS: ~$1,440–3,540/year**
 
@@ -85,14 +87,17 @@ Merging 11 services to 8 reduces infrastructure by 3 units across every layer.
 
 ---
 
-## 5. Total Technology Decision Savings
+## 5. Total Technology Decision Savings (Updated)
 
 | Decision | Annual Saving |
 |---|---|
-| RabbitMQ over Kafka | ~$2,796 |
+| SNS+SQS over Kafka | ~$5,556 ($463 → $0.40/month) |
+| SNS+SQS over RabbitMQ | ~$2,748 ($230 → $0.40/month) |
+| AWS API Gateway over ALB + Spring Cloud Gateway ECS | ~$420 (removes ~$35/month ALB + $15/month ECS tasks) |
+| AWS Cloud Map over Eureka ECS | ~$120 (removes $10/month ECS task) |
 | ECS over EKS | ~$1,440–3,540 |
 | Service merge (11→8) | ~$1,440 |
-| **Total annual saving** | **~$5,676–7,776/year** |
+| **Total annual saving vs original v3.0 estimate** | **~$8,124–11,244/year** |
 
 ---
 
@@ -106,7 +111,7 @@ Start all services on `db.t3.small` ($40/month, Multi-AZ). After 3 months of pro
 Target: reduce `db.t3.small` → `db.t3.micro` for at least 4 low-traffic services (inventory, workplace, notification, audit) → saves ~$80/month
 
 ### 6.2 ECS Fargate Spot for Non-Critical Services
-`notification-service` and `audit-service` are Kafka consumers with no synchronous user-facing latency requirement. Both can tolerate occasional task interruptions.
+`notification-service` and `audit-service` are SQS consumers with no synchronous user-facing latency requirement. Both can tolerate occasional task interruptions.
 
 - Fargate Spot pricing: ~70% discount vs on-demand
 - Apply to: `notification-service`, `audit-service`, `workplace-service`, `inventory-service`
@@ -123,8 +128,8 @@ Dev: scale to 0 tasks on weekends
 
 Estimated saving on staging/dev: ~$30–50/month
 
-### 6.4 Amazon MQ Serverless (Future)
-Amazon MQ for RabbitMQ Serverless (if available in region) charges per-GB transferred rather than per broker-hour. At OMS traffic (~2,500 msgs/day × 1KB average = ~2.5 MB/day), serverless would cost ~$0.75/month. Worth evaluating once the feature reaches general availability in your region.
+### 6.4 SNS + SQS Messaging Cost
+SQS is already near-zero cost (~$0.40/month at OMS traffic volumes) — no further optimisation needed for messaging. The combination of SNS fan-out with SQS queues and DLQs is the lowest-cost HA messaging solution available in AWS at this scale.
 
 ### 6.5 S3 Lifecycle Policies for Audit Archival
 - Active audit records: RDS (`audit_db`) — 24 months
@@ -147,7 +152,7 @@ The attendance badge sync runs nightly rather than in real-time. This avoids:
 
 | Factor | Impact |
 |---|---|
-| Spring Cloud ecosystem (all Java) | Team does not need to learn multiple languages or frameworks — reduced ramp-up cost |
+| Polyglot (Java Spring Boot + Python FastAPI) — adds modest ramp-up cost offset by operational savings | Team learns two languages/frameworks; offset by ~$2,748/year messaging saving and simpler operations |
 | 8 services (vs 11) | 3 fewer services to build, test, document, and operate — significant developer time saving |
 | TestContainers | Real database and broker in CI — reduces production bugs from mock divergence |
 | Pact contract testing | Catches breaking API changes in CI before deployment — avoids costly production incidents |
@@ -159,12 +164,12 @@ The attendance badge sync runs nightly rather than in real-time. This avoids:
 
 | Cost Category | Year 1 | Year 2 | Year 3 |
 |---|---|---|---|
-| AWS Infrastructure | $8,520–11,640 | $8,520–11,640 | $8,520–11,640 |
-| After optimisation (est. 20% reduction) | $6,816–9,312 | $6,816–9,312 | $6,816–9,312 |
+| AWS Infrastructure | $4,920–7,800 | $4,920–7,800 | $4,920–7,800 |
+| After optimisation (est. 20% reduction) | $3,936–6,240 | $3,936–6,240 | $3,936–6,240 |
 | Development (team salaries) | Dominant cost | Dominant cost | Dominant cost |
 | Infrastructure as % of total | < 5% typical for team of 5–8 | < 5% | < 5% |
 
-Infrastructure cost is not the dominant concern for OMS — development velocity and operational simplicity are. Decisions were made to reduce operational complexity (ECS over EKS, RabbitMQ over Kafka) even where the infrastructure cost difference is small, because the saved developer-hours compound over the lifetime of the system.
+Infrastructure cost is not the dominant concern for OMS — development velocity and operational simplicity are. Decisions were made to reduce operational complexity (ECS over EKS, SNS+SQS over RabbitMQ/Kafka) even where the infrastructure cost difference is small, because the saved developer-hours compound over the lifetime of the system.
 
 ---
 
@@ -172,8 +177,8 @@ Infrastructure cost is not the dominant concern for OMS — development velocity
 
 | Metric | Tool | Alert Threshold |
 |---|---|---|
-| Monthly AWS spend | AWS Cost Explorer + Budget Alert | > $1,200/month |
+| Monthly AWS spend | AWS Cost Explorer + Budget Alert | > $800/month |
 | RDS storage growth | CloudWatch `FreeStorageSpace` | < 5 GB remaining |
 | ECS task count (scaling events) | CloudWatch ECS metrics | > 8 tasks on any service |
-| Amazon MQ queue depth | CloudWatch MQ metrics | > 10,000 messages any queue |
+| SQS DLQ depth | CloudWatch `ApproximateNumberOfMessagesVisible` | > 0 on any DLQ → alert |
 | Data transfer costs | AWS Cost Explorer | > $50/month |

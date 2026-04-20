@@ -1,9 +1,9 @@
 # SYSTEM ARCHITECTURE: Office Management System (OMS)
-**Version:** 3.0 — Spring Cloud Edition  
+**Version:** 4.0 — AWS-Native Edition  
 **Status:** Draft  
 **Last Updated:** April 2026  
-**Frontend:** React | **Backend:** Java 21 + Spring Boot 3.x + Spring Cloud  
-**Broker:** RabbitMQ (Amazon MQ) | **Orchestration:** AWS ECS Fargate
+**Frontend:** React | **Backend:** Java 21 + Spring Boot 3.x (core services) + FastAPI / Python 3.12 (async services)  
+**Broker:** SNS + SQS | **Orchestration:** AWS ECS Fargate | **Discovery:** AWS Cloud Map
 
 ---
 
@@ -11,12 +11,12 @@
 
 The Office Management System (OMS) is a cloud-native, event-driven microservices platform that replaces manual, spreadsheet-driven office operations with a unified, auditable, location-aware system. It serves employees, managers, HR, and facilities staff across 2–5 office locations.
 
-The platform is composed of **8 independently deployable Spring Boot services**, each owning exactly one business capability and its own PostgreSQL database. All external traffic enters through a Spring Cloud Gateway. Services discover each other via Netflix Eureka. Asynchronous workflows use RabbitMQ via Amazon MQ with Topic Exchanges and durable queues. All infrastructure runs on AWS ECS Fargate.
+The platform is composed of **8 independently deployable services** (Spring Boot or FastAPI), each owning exactly one business capability and its own PostgreSQL database. All external traffic enters through **AWS API Gateway (HTTP API)** backed by a **VPC Link**. Services discover each other via **AWS Cloud Map** private DNS. Asynchronous workflows use **Amazon SNS + SQS** (fan-out pattern). All infrastructure runs on AWS ECS Fargate. Authentication at the edge uses an **AWS Lambda Authorizer** that calls `auth-service /internal/validate` and returns user context as request context. CI/CD runs through **GitHub → Jenkins → ECR → ECS**.
 
 **Three non-negotiable architectural rules drive every decision:**
 1. **No shared databases** — each service owns its data exclusively; cross-service data flows through events and APIs
 2. **No direct calls to notification or audit services** — these are event-driven only; no service waits for them
-3. **Zero Trust** — every service validates every caller on every request, regardless of network position
+3. **Zero Trust** — every service validates every caller on every request via internal JWT, regardless of network position
 
 ---
 
@@ -34,7 +34,7 @@ The platform is composed of **8 independently deployable Spring Boot services**,
 | F-06 | No-show auto-release: unattended bookings released at configurable daily cutoff |
 | F-07 | Remote day and OOO request/approval workflow with configurable policy enforcement |
 | F-08 | Approval delegation: manager nominates delegate before going OOO |
-| F-09 | Event-driven in-app and email notification dispatch |
+| F-09 | Event-driven in-app and email notification dispatch via Amazon SES |
 | F-10 | Immutable, append-only audit log for all state-changing operations |
 | F-11 | Visitor pre-registration, walk-in handling, check-in/out, agreement versioning (Phase 2) |
 | F-12 | Office event management, RSVP, waitlist, recurring events (Phase 2) |
@@ -50,25 +50,25 @@ The platform is composed of **8 independently deployable Spring Boot services**,
 | Seat booking latency | < 200ms p95 under normal load |
 | Scale | 2–5 locations, hundreds of employees at launch; horizontally scalable |
 | Authentication | SSO only; OAuth 2.0 / OIDC |
-| Authorisation | Role + location checks at gateway (coarse) and within each service (authoritative) |
+| Authorisation | Lambda Authorizer at API Gateway (coarse) + role + location check within each service (authoritative) |
 | Internal security | Zero Trust; internal JWT on every service-to-service call |
 | Data isolation | Database per service; no shared schemas; no cross-service DB access |
 | SQL safety | Parameterised queries only; no string concatenation |
 | Resilience | Circuit breaker, retry (max 3), timeout (3s), fallback on every REST call |
-| Idempotency | All RabbitMQ consumers idempotent; duplicate delivery safe |
-| Observability | Structured JSON logs, Prometheus metrics, OpenTelemetry traces, health probes on all services |
+| Idempotency | All SQS consumers idempotent; duplicate delivery safe |
+| Observability | Structured JSON logs → CloudWatch, CloudWatch Container Insights, CloudWatch Alarms |
 | Audit retention | 24 months active; archived to S3 thereafter |
 
 ### Constraints
 
 | Constraint | Detail |
 |---|---|
-| Technology | React frontend, Java 21/Spring Boot 3.x per service — team expertise |
+| Technology | React frontend; Java 21 / Spring Boot 3.x for core services; Python 3.12 / FastAPI for async/data services |
 | Auth | Must integrate with existing SSO provider (OAuth 2.0 / OIDC) |
 | Employee data | Arms HR system is the source of truth; `auth-service` syncs from it |
 | Badge data | Ingested from AWS Athena nightly batch; real-time streaming deferred |
-| Procurement | API contract pending discovery session (Phase 2 blocker) |
-| Tracing | AWS X-Ray excluded; OpenTelemetry + Jaeger required |
+| CI/CD | GitHub → Jenkins → ECR → ECS Fargate |
+| Tracing | CloudWatch Container Insights + structured correlation IDs |
 
 ---
 
@@ -78,36 +78,35 @@ The platform is composed of **8 independently deployable Spring Boot services**,
 
 No service accesses another service's database. Cross-service relationships use ID values only.
 
-| Service | Owned Entities |
-|---|---|
-| `auth-service` | Session, User, UserRole, Location, LocationConfig, PublicHoliday |
-| `attendance-service` | BadgeEvent (immutable), WorkSession, AttendanceRecord, BadgeSyncJobLog |
-| `seating-service` | Floor, Zone, Seat, SeatBooking, BlockReservation, NoShowRecord |
-| `remote-service` | RemoteRequest, RecurringRemoteSchedule, OOORequest, ApprovalDelegate, RemoteDayPolicy |
-| `notification-service` | Notification, NotificationTemplate |
-| `audit-service` | AuditLog (append-only, INSERT-only DB user) |
-| `inventory-service` | SupplyCategory, SupplyItem, SupplyStockEntry, SupplyRequest, ReorderLog, AssetCategory, Asset, AssetAssignment, AssetRequest, MaintenanceRecord, FaultReport |
-| `workplace-service` | VisitorProfile, ParentVisit, VisitRecord, AgreementTemplate, EventSeries, Event, EventInvite |
+| Service | Runtime | Owned Entities |
+|---|---|---|
+| `auth-service` | Spring Boot | Session, User, UserRole, Location, LocationConfig, PublicHoliday |
+| `attendance-service` | **FastAPI** | BadgeEvent (immutable), WorkSession, AttendanceRecord, BadgeSyncJobLog |
+| `seating-service` | Spring Boot | Floor, Zone, Seat, SeatBooking, BlockReservation, NoShowRecord |
+| `remote-service` | Spring Boot | RemoteRequest, RecurringRemoteSchedule, OOORequest, ApprovalDelegate, RemoteDayPolicy |
+| `notification-service` | **FastAPI** | Notification, NotificationTemplate |
+| `audit-service` | Spring Boot | AuditLog (append-only, INSERT-only DB user) |
+| `inventory-service` | Spring Boot | SupplyCategory, SupplyItem, SupplyStockEntry, SupplyRequest, ReorderLog, AssetCategory, Asset, AssetAssignment, AssetRequest, MaintenanceRecord, FaultReport |
+| `workplace-service` | Spring Boot | VisitorProfile, ParentVisit, VisitRecord, AgreementTemplate, EventSeries, Event, EventInvite |
 
-### Cross-Service Event Flow
+### Cross-Service Event Flow (SNS → SQS Fan-out)
 
 ```
-auth-service         → publishes user.deactivated
-attendance-service   → consumes user.deactivated (stop generating records)
-seating-service      → consumes user.deactivated (cancel future bookings)
+auth-service         → publishes to SNS: oms-user
+                         → SQS: oms-user-notification  (notification-service)
+                         → SQS: oms-user-audit         (audit-service)
 
-remote-service       → publishes remote.request.approved
-attendance-service   → consumes remote.request.approved (overlay REMOTE status)
-notification-service → consumes remote.request.approved (notify employee)
+remote-service       → publishes to SNS: oms-remote
+                         → SQS: oms-remote-attendance   (attendance-service)
+                         → SQS: oms-remote-notification (notification-service)
+                         → SQS: oms-remote-audit        (audit-service)
 
-attendance-service   → publishes attendance.no_show.detected
-seating-service      → consumes attendance.no_show.detected (release unattended booking)
+attendance-service   → publishes to SNS: oms-attendance
+                         → SQS: oms-attendance-seating  (seating-service)
+                         → SQS: oms-attendance-audit    (audit-service)
 
-(all services)       → publish oms.audit.event
-audit-service        → consumes all audit events (persist immutably)
-
-(all services)       → publish domain events to their exchange
-notification-service → consumes relevant notification-triggering events
+(all services)       → publish to SNS: oms-audit
+                         → SQS: oms-audit-service       (audit-service)
 ```
 
 ---
@@ -117,57 +116,76 @@ notification-service → consumes relevant notification-triggering events
 ### System Diagram
 
 ```
-React SPA (Browser)
+🌍 USER (Browser / Mobile)
         │  HTTPS / TLS 1.3
         ▼
-[AWS ALB — public-facing]
+┌───────────────────────────────────────────────────┐
+│   Amazon CloudFront (CDN + SSL termination)        │
+│   - Caches static React SPA assets               │
+│   - Routes /api/** to API Gateway                │
+└───────────────────────────────────────────────────┘
         │
         ▼
-[Spring Cloud Gateway — ECS Fargate, 2+ tasks, port 8080]
-   Session validation → auth-service (Eureka lb://)
-   Routing by path    → lb://service-name (Eureka)
-   Rate limiting      → Redis (ElastiCache)
-   Correlation ID     → X-Correlation-ID generated and propagated
-        │  HTTPS internal (VPC private subnets)
+┌───────────────────────────────────────────────────┐
+│   AWS API Gateway (HTTP API)                       │
+│   - Lambda Authorizer → auth-service /validate   │
+│   - Rate limiting (usage plans)                  │
+│   - CORS enforcement                             │
+│   - X-Correlation-ID injection                   │
+│   - Routes /api/v1/** → VPC Link                 │
+└───────────────────────────────────────────────────┘
+        │  VPC Link (private)
         ▼
-┌───────────────────────────────────────────────────────────┐
-│                  ECS Cluster: oms-cluster                  │
-│                                                            │
-│  [eureka-server]  :8761  — service registry (2 tasks HA)  │
-│                                                            │
-│  [auth-service]   :8081  SSO · users · roles · HR sync    │
-│  [attendance]     :8083  badge ingestion · attendance      │
-│  [seating]        :8084  floor plans · bookings            │
-│  [remote]         :8085  remote/OOO requests · approvals  │
-│  [notification]   :8086  in-app + email dispatch          │
-│  [audit]          :8087  immutable audit log               │
-│  [inventory]      :8090  supplies + assets  (Phase 2)     │
-│  [workplace]      :8088  visitors + events  (Phase 2)     │
-└─────────────────────────┬─────────────────────────────────┘
-                          │
-        ┌─────────────────┼──────────────────┐
-        │                 │                  │
-   Amazon MQ          AWS RDS            AWS S3
-   RabbitMQ           PostgreSQL         Audit archival
-   active/standby     8 isolated         > 24 months
-   Topic Exchanges    instances          Glacier IR
-   Durable Queues
+┌──────────────────────────────────────────────────────────────┐
+│                  AWS VPC — Private Subnets                    │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │              ECS Cluster: oms-cluster                   │  │
+│  │                                                        │  │
+│  │  auth-service         :8081  Spring Boot               │  │
+│  │  attendance-service   :8083  FastAPI                   │  │
+│  │  seating-service      :8084  Spring Boot               │  │
+│  │  remote-service       :8085  Spring Boot               │  │
+│  │  notification-service :8086  FastAPI                   │  │
+│  │  audit-service        :8087  Spring Boot               │  │
+│  │  inventory-service    :8090  Spring Boot  (Phase 2)    │  │
+│  │  workplace-service    :8088  Spring Boot  (Phase 2)    │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │           AWS Cloud Map — oms.local namespace           │  │
+│  │   auth-service.oms.local          :8081                │  │
+│  │   attendance-service.oms.local    :8083                │  │
+│  │   seating-service.oms.local       :8084                │  │
+│  │   remote-service.oms.local        :8085                │  │
+│  │   notification-service.oms.local  :8086                │  │
+│  │   audit-service.oms.local         :8087                │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                          │                                   │
+│        ┌─────────────────┼──────────────────┐               │
+│        │                 │                  │               │
+│   Amazon SNS+SQS    AWS RDS            AWS S3              │
+│   Fan-out queues    PostgreSQL          Audit archival       │
+│   Standard queues   8 isolated          > 24 months         │
+│   FIFO where        instances           Glacier IR           │
+│   ordering needed                                           │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Service Inventory
 
-| Service | Port | Phase | Replaces | Min Tasks | Key Dependencies |
+| Service | Runtime | Port | Phase | Min Tasks | Key Dependencies |
 |---|---|---|---|---|---|
-| `api-gateway` | 8080 | 1 | — | 2 | auth-service, Eureka, Redis |
-| `eureka-server` | 8761 | 1 | — | 2 | — |
-| `auth-service` | 8081 | 1 | identity + user | 2 | SSO provider, Arms HR API |
-| `attendance-service` | 8083 | 1 | attendance | 2 | AWS Athena, auth-service (REST), RabbitMQ |
-| `seating-service` | 8084 | 1 | seating | 2 | auth-service (REST), RabbitMQ |
-| `remote-service` | 8085 | 1 | remote | 2 | auth-service (REST), RabbitMQ |
-| `notification-service` | 8086 | 1 | notification | 2 | RabbitMQ, email provider |
-| `audit-service` | 8087 | 1 | audit | 2 | RabbitMQ |
-| `inventory-service` | 8090 | 2 | supplies + assets | 2 | auth-service (REST), RabbitMQ |
-| `workplace-service` | 8088 | 2 | visitor + event | 2 | auth-service (REST), RabbitMQ |
+| `auth-service` | Spring Boot | 8081 | 1 | 2 | SSO provider, Arms HR API |
+| `attendance-service` | **FastAPI** | 8083 | 1 | 2 | AWS Athena, auth-service (HTTP), SQS |
+| `seating-service` | Spring Boot | 8084 | 1 | 2 | auth-service (HTTP), SQS |
+| `remote-service` | Spring Boot | 8085 | 1 | 2 | auth-service (HTTP), SQS |
+| `notification-service` | **FastAPI** | 8086 | 1 | 2 | SQS, Amazon SES |
+| `audit-service` | Spring Boot | 8087 | 1 | 2 | SQS |
+| `inventory-service` | Spring Boot | 8090 | 2 | 2 | auth-service (HTTP), SQS |
+| `workplace-service` | Spring Boot | 8088 | 2 | 2 | auth-service (HTTP), SQS |
+
+> **No `api-gateway` ECS service.** AWS API Gateway is a fully managed AWS service — no container to deploy. No `eureka-server` ECS service. AWS Cloud Map is a fully managed AWS service.
 
 ---
 
@@ -177,36 +195,34 @@ React SPA (Browser)
 
 **PostgreSQL 16 (AWS RDS, Multi-AZ, `db.t3.small`)** — one isolated instance per service.
 
-Justification:
 - JSONB support for audit state snapshots and raw badge event payloads
-- Relational integrity within service boundaries
-- Consistent tooling across all services: Spring Data JPA / Hibernate, Flyway migrations, TestContainers
-- No polyglot overhead: all services share the same data model characteristics
+- Consistent tooling: Spring Data JPA / Hibernate (Spring Boot services), SQLAlchemy async / Alembic (FastAPI services)
+- No polyglot overhead — all services share the same data model characteristics
 
 ### Database Isolation Guarantee
 
 ```
-Service:         seating-service
-DB instance:     seating_db (RDS)
-DB user:         seating_app (SELECT, INSERT, UPDATE, DELETE on seating_* tables)
-Firewall:        sg-rds-seating allows inbound 5432 from sg-seating-service ONLY
+Service:         attendance-service
+DB instance:     attendance_db (RDS)
+DB user:         attendance_app (SELECT, INSERT, UPDATE, DELETE on attendance_* tables)
+Firewall:        sg-rds-attendance allows inbound 5432 from sg-attendance-service ONLY
 
-No other service's DB user has ANY privilege on seating_db.
-No other service's security group can reach the seating_db instance.
-This is enforced at both the application AND network level.
+No other service's DB user has ANY privilege on attendance_db.
+No other service's security group can reach the attendance_db instance.
+Enforced at both application AND network level.
 ```
 
 ### Attendance Data Pipeline
 
 ```
 AWS Athena (badge_events table)
-        ↓ nightly BadgeSyncJob (2am, configurable per location)
+        ↓ nightly BadgeSyncJob (2am, APScheduler, configurable per location)
 BadgeEvent records (immutable; persisted once; never modified)
-        ↓ WorkSession resolution engine
+        ↓ WorkSession resolution engine (pure Python)
 WorkSession (first_badge_in, last_badge_out, total_duration, is_late, crosses_midnight)
-        ↓ Pass 1
+        ↓ Pass 1 (AttendancePass1Service)
 AttendanceRecord: PRESENT or LATE (from badge data)
-        ↓ Pass 2 (RabbitMQ consumers)
+        ↓ Pass 2 (SQS consumers overlay status corrections)
 Final AttendanceRecord: PRESENT / LATE / ABSENT / REMOTE / OOO / PUBLIC_HOLIDAY
 ```
 
@@ -217,7 +233,7 @@ Final AttendanceRecord: PRESENT / LATE / ABSENT / REMOTE / OOO / PUBLIC_HOLIDAY
 ### Global API Conventions
 
 - **Base path:** `/api/v1/`
-- **Auth:** HTTP-only session cookie validated by gateway on every request
+- **Auth:** HTTP-only session cookie validated by Lambda Authorizer at API Gateway on every request
 - **Response envelope:** `{ "success": true/false, "data": {}, "error": null }`
 - **Pagination:** `?page=0&size=20` on all list endpoints; never unbounded
 - **Content type:** `application/json`
@@ -243,18 +259,19 @@ Final AttendanceRecord: PRESENT / LATE / ABSENT / REMOTE / OOO / PUBLIC_HOLIDAY
 /api/v1/events/**            → workplace-service:8088  (Phase 2)
 ```
 
-### RabbitMQ Exchange Registry
+All routes resolve via Cloud Map DNS (e.g. `http://attendance-service.oms.local:8083`) — the VPC Link bridges API Gateway to the private namespace.
 
-| Exchange | Type | Producer | Consumer Queues |
+### SNS Topic + SQS Queue Registry
+
+| SNS Topic | Event Types Published | Producer | SQS Consumer Queues |
 |---|---|---|---|
-| `oms.user` | topic | auth-service | notification, audit |
-| `oms.attendance` | topic | attendance-service | seating, audit |
-| `oms.seating` | topic | seating-service | notification, audit |
-| `oms.remote` | topic | remote-service | attendance, notification, audit |
-| `oms.visitor` | topic | workplace-service | notification, audit |
-| `oms.event` | topic | workplace-service | notification, audit |
-| `oms.inventory` | topic | inventory-service | notification, audit |
-| `oms.audit` | topic | all services | audit-service |
+| `oms-user` | `user.created`, `user.updated`, `user.deactivated` | auth-service | `oms-user-notification`, `oms-user-audit` |
+| `oms-attendance` | `record.resolved`, `no_show.detected`, `restamp.requested` | attendance-service | `oms-attendance-seating`, `oms-attendance-audit` |
+| `oms-seating` | `booking.created`, `booking.cancelled`, `booking.released` | seating-service | `oms-seating-notification`, `oms-seating-attendance`, `oms-seating-audit` |
+| `oms-remote` | `request.submitted`, `request.approved`, `request.rejected`, `ooo.request.approved` | remote-service | `oms-remote-attendance`, `oms-remote-notification`, `oms-remote-audit` |
+| `oms-audit` | all event types | all services | `oms-audit-service` |
+
+All queues have a corresponding DLQ: `{queue-name}-dlq`. Standard queues used unless ordering is critical (FIFO queues used only for `oms-audit-service`).
 
 ---
 
@@ -265,13 +282,13 @@ Final AttendanceRecord: PRESENT / LATE / ABSENT / REMOTE / OOO / PUBLIC_HOLIDAY
 ```
 Internet
     ↓ HTTPS TLS 1.3
-AWS ALB (public subnet)
-    ↓
-Spring Cloud Gateway (ECS Fargate, 2+ tasks, private subnet)
-    ↓ HTTPS internal
-ECS Cluster (8 services + Eureka, private subnets, multi-AZ)
-    ↓
-Amazon MQ RabbitMQ (active/standby, private subnets)
+Amazon CloudFront
+    ↓ /api/** forwarded
+AWS API Gateway (HTTP API) — public endpoint
+    ↓ VPC Link
+ECS Cluster (8 services, private subnets, multi-AZ)
+    ↓ service-to-service via Cloud Map DNS (oms.local)
+Amazon SNS + SQS (async fan-out, private subnets)
 AWS RDS PostgreSQL (Multi-AZ, private subnets, 8 instances)
 AWS S3 (audit archival, Glacier Instant Retrieval)
 ```
@@ -280,28 +297,40 @@ AWS S3 (audit archival, Glacier Instant Retrieval)
 
 | Service | Configuration | Monthly Cost (est.) |
 |---|---|---|
-| ECS Fargate | 10 services × 2 tasks avg, 0.25 vCPU, 512 MB | ~$80–150 |
-| Amazon MQ | `mq.m5.large` active/standby | ~$230 |
+| ECS Fargate | 8 services × 2 tasks avg, 0.25–0.5 vCPU, 512–1024 MB | ~$80–130 |
+| AWS API Gateway | HTTP API, ~1M req/month | ~$1–3 |
+| Amazon CloudFront | Static assets + API proxy | ~$5–15 |
+| Lambda Authorizer | ~1M invocations/month (cached 300s TTL) | ~$0.20 |
+| Amazon SNS | ~2,500 messages/day | < $1 |
+| Amazon SQS | ~2,500 messages/day | < $1 |
+| Amazon SES | Email dispatch | ~$0.10/1000 emails |
 | AWS RDS | 8 × `db.t3.small` Multi-AZ | ~$300–480 |
-| AWS ALB | 2 LCUs baseline | ~$20–35 |
-| ElastiCache | `cache.t3.micro` | ~$15 |
-| **Total** | | **~$710–970/month** |
+| ElastiCache | `cache.t3.micro` (API GW rate-limit state) | ~$15 |
+| AWS Cloud Map | Private DNS namespace | ~$1–2 |
+| **Total** | | **~$410–650/month** |
 
-### CI/CD Per Service
+> Removing Amazon MQ (`mq.m5.large` at ~$230/month) and Spring Cloud Gateway ECS tasks saves ~$280–350/month vs v3.0.
+
+### CI/CD Pipeline
 
 ```
-PR created → GitHub Actions:
-  1. Checkstyle lint
-  2. JUnit 5 unit tests
-  3. Spring Boot + TestContainers integration tests
-  4. Pact consumer contract tests
-  5. OWASP Dependency Check (fail CVSS >= 7)
-  6. Docker multi-stage build
-  7. Push to AWS ECR (on merge)
+Developer pushes to GitHub (feature branch)
+    ↓
+Pull Request opened → Jenkins pipeline triggered:
+    1. Checkstyle / flake8 lint
+    2. JUnit 5 / pytest unit tests
+    3. Spring Boot Test + TestContainers / pytest + testcontainers integration tests
+    4. Pact consumer contract tests
+    5. OWASP Dependency Check / pip-audit (fail CVSS >= 7)
+    6. Docker multi-stage build
+    7. Push image to AWS ECR (on merge to develop/staging/main)
+    8. aws ecs update-service --force-new-deployment
+    9. aws ecs wait services-stable
 
-develop → auto-deploy DEV
-staging → auto-deploy STAGING + Pact provider verify
-main    → manual approval gate → PRODUCTION (with rollback plan)
+Branches:
+  develop → auto-deploy DEV
+  staging → auto-deploy STAGING + Pact provider verify
+  main    → manual approval gate → PRODUCTION + rollback plan
 ```
 
 ---
@@ -319,48 +348,77 @@ main    → manual approval gate → PRODUCTION (with rollback plan)
 6. auth-service creates session in auth_db
 7. auth-service issues HTTP-only SameSite=Strict session cookie
 8. All subsequent requests: browser sends cookie automatically
-9. Gateway extracts cookie → calls auth-service /validate
-10. auth-service returns UserContext { userId, roles, locationIds }
-11. Gateway generates internal JWT, injects X-User-* headers, forwards to service
-12. Service validates internal JWT, performs role + location check
+
+Per request (via Lambda Authorizer):
+9.  Request hits CloudFront → forwarded to API Gateway
+10. API Gateway invokes Lambda Authorizer (cache TTL: 300s)
+11. Lambda Authorizer extracts SESSION cookie → calls auth-service /internal/validate
+12. auth-service returns UserContext { userId, roles, locationIds } or 401
+13. Lambda Authorizer returns IAM ALLOW policy + context (userId, roles, locationIds)
+14. API Gateway injects context as request headers: X-User-Id, X-User-Roles, X-Location-Ids
+15. API Gateway generates X-Correlation-ID, injects it as header
+16. API Gateway generates internal JWT (signed with INTERNAL_JWT_SECRET), injects Authorization header
+17. Request forwarded via VPC Link → Cloud Map DNS → ECS service
+18. Service validates internal JWT via Spring Security / python-jose
+19. Service performs authoritative role + location check
 ```
 
 ### Security Controls Summary
 
 | Layer | Control |
 |---|---|
-| Network | VPC private subnets; ALB only public entry point; security groups per service |
-| Edge | Rate limiting (100 req/s per user); CORS enforcement; AWS WAF (OWASP CRS) |
+| CDN | CloudFront WAF (OWASP managed rule set); TLS 1.3 |
+| Edge | API Gateway rate limiting (usage plans); CORS enforcement; Lambda Authorizer (300s cache) |
 | Identity | SSO only; HTTP-only cookies; immediate session revocation |
 | Service-to-Service | Internal JWT (HMAC-SHA256, 300s TTL); validated on every inbound call |
-| Authorisation | Role + location check in every service (`@PreAuthorize` + service layer) |
+| Authorisation | Role + location check in every service |
 | Data | Parameterised SQL; soft deletes; separate DB user per service; INSERT-only for audit |
 | Secrets | AWS Secrets Manager; injected as env vars; never in code or git |
-| Transport | TLS 1.3 external; HTTPS internal |
-| Audit | Immutable audit log via RabbitMQ consumer; no REST write endpoint |
+| Transport | TLS 1.3 CloudFront→API GW; HTTPS VPC-internal |
+| Audit | Immutable audit-service log via SQS consumer; no REST write endpoint |
+| Network | VPC private subnets; Cloud Map DNS not publicly resolvable; security groups per service |
 
 ---
 
-## ARCHITECTURE DECISION RECORDS
+## OBSERVABILITY
 
-Full ADR log is in [adr.md](adr.md). Key decisions:
+All services emit **structured JSON logs** to **CloudWatch Logs** (`/oms/{service-name}` log group).
 
-| ADR | Decision | Primary Trade-off |
+```json
+{
+  "timestamp": "2026-04-17T09:15:00Z",
+  "level": "INFO",
+  "service": "attendance-service",
+  "correlationId": "abc-123",
+  "userId": "uuid",
+  "message": "Attendance record stamped",
+  "recordDate": "2026-04-16",
+  "status": "PRESENT"
+}
+```
+
+| Tool | Purpose |
+|---|---|
+| CloudWatch Logs | Centralised log aggregation; log groups per service |
+| CloudWatch Container Insights | ECS CPU, memory, task health metrics |
+| CloudWatch Alarms | Alert on error rate spikes, DLQ depth > 0, ECS task failures |
+| CloudWatch Dashboards | Per-service request rates, latency, error counts |
+
+`X-Correlation-ID` generated at API Gateway, propagated via HTTP headers to all downstream services and included as `correlationId` in every SQS message — enables full request tracing via CloudWatch Logs Insights.
+
+---
+
+## ARCHITECTURE DECISION RECORDS (Summary)
+
+Full ADR log is in [adr.md](adr.md). Key decisions for v4.0:
+
+| ADR | Decision | Trade-off |
 |---|---|---|
-| ADR-001 | React frontend | Less opinionated — team sets conventions |
-| ADR-002 | Microservices | Distributed complexity accepted |
-| ADR-003 | 8 services (merged from 11) | Larger merged codebases |
-| ADR-004 | ECS Fargate over EKS | No Istio — internal JWT-based Zero Trust instead |
-| ADR-005 | Netflix Eureka | Eureka Server is additional infrastructure |
-| ADR-006 | Spring Cloud Gateway | Java filter code + Redis for rate limiting |
-| ADR-007 | RabbitMQ over Kafka/SQS | No event replay; saves ~$2,796/year vs Kafka |
-| ADR-008 | REST not GraphQL | Dashboard composition via BFF endpoint |
-| ADR-009 | PostgreSQL per service | 8 RDS instances; no cross-service joins |
-| ADR-010 | Zero Trust — internal JWT | Manual cert rotation without Istio |
-| ADR-012 | OpenTelemetry + Jaeger | Jaeger must be operated as ECS service |
-| ADR-013 | HTTP-only session cookie | CSRF protection required |
-| ADR-014 | Notification/audit event-driven only | Audit is slightly async |
-| ADR-020 | Location-scoped RBAC | Every auth check needs role + location |
+| ADR-005 | AWS Cloud Map over Netflix Eureka | No ECS Eureka service to operate; DNS-based; zero library config |
+| ADR-006 | AWS API Gateway (HTTP API) over Spring Cloud Gateway | No ECS gateway service; Lambda Authorizer adds ~5ms cold start (mitigated by 300s cache) |
+| ADR-007 | SNS + SQS over RabbitMQ (Amazon MQ) | No broker to operate; SNS fan-out replaces topic exchanges; saves ~$230/month |
+| ADR-012 | CloudWatch over Prometheus + Jaeger | No Jaeger ECS service to operate; less granular trace UI; saves ~$15–30/month infra |
+| ADR-021 | Polyglot runtimes: Spring Boot + FastAPI | Two build toolchains (Maven + pip); mitigated by shared Docker base image pattern |
 
 ---
 
@@ -368,34 +426,36 @@ Full ADR log is in [adr.md](adr.md). Key decisions:
 
 ### Pre-Development Actions (Must complete before M1)
 
-1. Confirm SSO provider JWKS endpoint availability and client_id/secret — blocks M2
+1. Confirm SSO provider JWKS endpoint and client_id/secret — blocks M2
 2. Obtain Arms HR API contract and test credentials — blocks M2 (HR sync)
 3. Confirm AWS Athena badge event schema and sample data — blocks M4
-4. Confirm email provider API contract — blocks notification-service
-5. Resolve Amazon MQ region availability (verify `mq.m5.large` active/standby in target region)
-6. Schedule procurement discovery session — blocks M10 reorder integration
+4. Configure API Gateway VPC Link to Cloud Map namespace
+5. Create SNS topics and SQS queues (IaC — Terraform or CDK)
+6. Configure Lambda Authorizer deployment and 300s cache
+7. Verify SES sending domain (DNS verification) — blocks notification-service
 
 ### Phase 1 Build Order
 
 ```
 M1: Infrastructure
-    ECS cluster, Amazon MQ, 8 RDS instances, ALB, Eureka Server,
-    Spring Cloud Gateway, Prometheus + Grafana, Jaeger, Secrets Manager
+    ECS cluster, SNS topics + SQS queues, 8 RDS instances,
+    API Gateway + VPC Link, Cloud Map namespace, Lambda Authorizer,
+    CloudFront distribution, CloudWatch dashboards + alarms
 
-M2: auth-service
+M2: auth-service (Spring Boot)
     SSO integration, session management, user profiles, roles, HR sync
-    (All other services depend on auth)
+    Lambda Authorizer depends on /internal/validate being live
 
-M3: audit-service + notification-service
-    RabbitMQ consumers must be live before business services start producing events
+M3: audit-service (Spring Boot) + notification-service (FastAPI)
+    SQS consumers must be live before business services publish events
 
-M4: attendance-service
+M4: attendance-service (FastAPI)
     Badge pipeline; publishes no_show events consumed by seating-service
 
-M5: seating-service
+M5: seating-service (Spring Boot)
     Consumes attendance events
 
-M6: remote-service
+M6: remote-service (Spring Boot)
     Publishes approved events consumed by attendance-service
 
 M7: Phase 1 hardening, security review, performance testing, UAT, launch
@@ -404,22 +464,22 @@ M7: Phase 1 hardening, security review, performance testing, UAT, launch
 ### Phase 2 Build Order
 
 ```
-M8:  workplace-service (visitor + event)
-M9:  inventory-service (supplies) — after procurement contract confirmed
-M10: inventory-service (assets) — can be delivered with M9 or separately
+M8:  workplace-service (Spring Boot) — visitor + event
+M9:  inventory-service (Spring Boot) — supplies
+M10: inventory-service — assets
 M11: Phase 2 hardening and launch
 ```
 
 ### Future Considerations (Post-Launch)
 
 - CQRS per service where read/write traffic diverges significantly
-- Redis caching for seat availability if query latency grows with seat count
-- Real-time badge streaming (replace nightly batch if same-day attendance required)
-- Spring Cloud Config Server for runtime config refresh without redeployment
-- Mobile app (React Native — shares API contracts; no backend changes needed)
-- Multi-region deployment if organisation expands beyond single AWS region
+- Redis caching for seat availability if query latency grows
+- Real-time badge streaming (replace nightly Athena batch if same-day attendance required)
+- Kafka (AWS MSK) if event replay or high-throughput streaming becomes a requirement
+- Mobile app (React Native — shares API contracts; no backend changes)
+- Multi-region if organisation expands beyond single AWS region
 
 ---
 
-*End of System Architecture Document*  
+*End of System Architecture Document v4.0*  
 *See [README.md](README.md) for the full documentation index.*

@@ -1,7 +1,7 @@
 # Solution Architecture Document
 ## Office Management System (OMS) — 5-Layer Excellence Model
 
-**Version:** 3.0 | **Author:** OMS Architecture Team | **Date:** April 2026
+**Version:** 4.0 | **Author:** OMS Architecture Team | **Date:** April 2026
 
 ---
 
@@ -46,12 +46,12 @@ The OMS replaces this fragmented landscape with a **cloud-native microservices p
 
 | Item | Detail |
 |---|---|
-| Technology | React frontend, Java 21/Spring Boot backend — team expertise |
+| Technology | React frontend, Java 21/Spring Boot (core services) + Python 3.12/FastAPI (attendance, notification) — polyglot team |
 | Auth | SSO provider supports OAuth 2.0 / OIDC and exposes a JWKS endpoint |
 | Employee data | Arms HR system is the authoritative source; OMS syncs from it |
 | Badge data | AWS Athena nightly batch — same-day attendance not required at launch |
 | Procurement | API contract for Phase 2 reorder integration is pending |
-| Tracing | AWS X-Ray excluded; OpenTelemetry + Jaeger |
+| Tracing | AWS X-Ray excluded; OpenTelemetry + Jaeger (self-hosted ECS task) |
 
 ---
 
@@ -80,7 +80,7 @@ The OMS replaces this fragmented landscape with a **cloud-native microservices p
 | Seat availability latency | < 200ms p95 | Prometheus `http_server_requests_seconds` |
 | Service independence | Zero-downtime independent deployment | CI/CD pipeline per service |
 | Fault isolation | Service failure → degraded mode, not outage | Resilience4j circuit breakers |
-| Audit completeness | 100% of mutations produce an audit event | RabbitMQ DLQ monitoring |
+| Audit completeness | 100% of mutations produce an audit event | SQS DLQ depth monitoring |
 | Scalability | Horizontal scaling per service | ECS Service Auto Scaling |
 | Security | Zero Trust; no shared secrets | Internal JWT; security groups; Secrets Manager |
 
@@ -125,7 +125,7 @@ Badge Events (Athena) + HR Data (Arms) + SSO Identity
 | Risk | Impact | Likelihood | Mitigation |
 |---|---|---|---|
 | SSO provider outage | High — all logins blocked | Low | Accepted; existing sessions continue until expiry |
-| RabbitMQ cluster failure | High — async workflows stall | Low | Amazon MQ active/standby; services continue; events queue and drain on reconnect |
+| SNS/SQS unavailability | Low — AWS-managed, 99.9% SLA | Very Low | Messages retained 4 days in SQS; services continue; events delivered when available |
 | auth-service unavailable | Medium — fallback responses | Low | Circuit breaker returns cached user data |
 | Badge sync job failure | Medium — attendance delayed by 1 day | Medium | PagerDuty alert; retry on next scheduled run |
 | Pact contract violation | High — cascading API failures | Medium | Pact tests catch violations in CI before deployment |
@@ -168,7 +168,7 @@ Badge Events (Athena) + HR Data (Arms) + SSO Identity
 
 **Notifications**
 - Event-driven in-app and email dispatch
-- Never called directly — always via RabbitMQ
+- Never called directly — always via SNS + SQS events
 
 ---
 
@@ -179,7 +179,7 @@ Badge Events (Athena) + HR Data (Arms) + SSO Identity
 **Microservices with event-driven backbone.**
 
 - **Synchronous REST** for user-facing queries requiring immediate response (with Resilience4j circuit breakers on every call)
-- **RabbitMQ** for all state change events, cross-service workflows, notification dispatch, and audit logging
+- **Amazon SNS + SQS** for all state change events, cross-service workflows, notification dispatch, and audit logging
 
 ### 5.2 Logical System Diagram
 
@@ -199,8 +199,8 @@ Badge Events (Athena) + HR Data (Arms) + SSO Identity
           └──────────────┴────────────────────────────┘
                                     │
                            ┌────────┴────────┐
-                           │   RabbitMQ       │
-                           │  Topic Exchanges  │
+                           │  Amazon SNS+SQS  │
+                           │  Topics + Queues  │
                            └────────┬─────────┘
                                     │
                     ┌───────────────┴────────────────┐
@@ -214,10 +214,10 @@ Badge Events (Athena) + HR Data (Arms) + SSO Identity
 | Scenario | Pattern | Rationale |
 |---|---|---|
 | User requests seat availability | REST (sync) | Immediate response required |
-| Seat booking confirmed | RabbitMQ event | Notification + audit don't delay the response |
-| Remote request approved | RabbitMQ event | Attendance overlay + notification + audit react independently |
+| Seat booking confirmed | SNS/SQS event | Notification + audit don't delay the response |
+| Remote request approved | SNS/SQS event | Attendance overlay + notification + audit react independently |
 | Manager dashboard aggregation | API Composition (parallel REST) | Attendance + remote + seating data composed in BFF |
-| Supply request fulfilment workflow | Choreography Saga via RabbitMQ | Multi-step; no orchestrator SPOF |
+| Supply request fulfilment workflow | Choreography Saga via SNS/SQS | Multi-step; no orchestrator SPOF |
 
 ---
 
@@ -229,10 +229,10 @@ Badge Events (Athena) + HR Data (Arms) + SSO Identity
 |---|---|---|---|---|
 | Frontend | React (TypeScript) | Team expertise; ecosystem; flexible component model | Angular | Team expertise shifted; less flexible |
 | Backend | Java 21, Spring Boot 3.x | Team expertise; Spring Cloud ecosystem integration | Node.js | No Spring Cloud; weaker type safety for complex domain |
-| API Gateway | Spring Cloud Gateway | Native Eureka integration; Java auth filter; no Lambda overhead | AWS API Gateway | Session cookie auth requires Lambda Authorizer; no Eureka support |
-| Service Discovery | Netflix Eureka | Native Spring Boot support; works with dynamic ECS IPs | AWS Cloud Map | Extra infrastructure; no OpenFeign native integration |
-| Message Broker | RabbitMQ (Amazon MQ) | Spring Cloud Stream binder; fan-out native; 50% cheaper than Kafka | Kafka (MSK) | Replay not needed; $463/month vs $230/month; higher ops overhead |
-| Message Broker | RabbitMQ (Amazon MQ) | Ecosystem fit with Spring Cloud Stream | SQS + SNS | No Spring Cloud Stream binder; SNS fan-out pattern adds 45+ queues |
+| API Gateway | AWS API Gateway HTTP API + Lambda Authorizer | Fully managed; 300s authorizer cache; VPC Link to ECS; ~70% cheaper than REST API; no ECS service to maintain | Spring Cloud Gateway | Requires Java ECS service + Redis for rate limiting; Lambda Authorizer solves session cookie auth natively |
+| Service Discovery | AWS Cloud Map | Private DNS namespace `oms.local`; ECS auto-registers tasks; zero client library; env var URLs | Netflix Eureka | Requires separate ECS service to run and maintain; no advantage over Cloud Map at this scale |
+| Message Broker | Amazon SNS + SQS | Near-zero cost (~$0.40/month); AWS-native fan-out; DLQ via Terraform RedrivePolicy; zero broker to operate | RabbitMQ (Amazon MQ) | ~$230/month managed broker; Spring Cloud Stream binder unnecessary once polyglot messaging accepted |
+| Message Broker | Amazon SNS + SQS | Fan-out via SNS → multiple SQS subscriptions with filter policies | Kafka (MSK) | Replay not needed at OMS scale; ~$463/month vs $0.40/month; high operational overhead |
 | Databases | PostgreSQL (AWS RDS) | JSONB; relational; consistent tooling | Polyglot | No benefit at this scale; adds ops overhead |
 | Orchestration | AWS ECS Fargate | No K8s control plane ops; right-sized for team | AWS EKS | $75/month K8s control plane; Kubernetes expertise required |
 | Tracing | OpenTelemetry + Jaeger | Vendor-neutral; Spring Boot 3 native | AWS X-Ray | Excluded by team decision |
@@ -240,15 +240,15 @@ Badge Events (Athena) + HR Data (Arms) + SSO Identity
 
 ### 6.2 Trade-off Comparison — Broker
 
-| Dimension | Kafka | RabbitMQ | SQS |
+| Dimension | Kafka | RabbitMQ | SNS + SQS |
 |---|---|---|---|
-| Monthly cost (OMS scale) | ~$463 | ~$230 | ~$0.09 |
-| Fan-out (native) | Yes | Yes | Needs SNS |
-| Spring Cloud Stream binder | Yes | Yes | No |
+| Monthly cost (OMS scale) | ~$463 | ~$230 | ~$0.40 |
+| Fan-out (native) | Yes | Yes | Via SNS subscriptions |
+| Spring Cloud Stream binder | Yes | Yes | No (AWS SDK v2 / aioboto3) |
 | Message replay | Full | No | No |
 | Operations complexity | High | Medium | Zero |
-| DLQ (built-in) | Manual | Built-in | Built-in |
-| **OMS verdict** | Over-spec + expensive | Right fit | No ecosystem fit |
+| DLQ (built-in) | Manual | Built-in | Built-in (Terraform RedrivePolicy) |
+| **OMS verdict** | Over-spec + expensive | Replaced in v4.0 (~$230/month unnecessary) | **Right fit (v4.0)** |
 
 ---
 
@@ -315,7 +315,7 @@ Nightly badge sync (02:00 UTC):
 
 High audit throughput (end of month reporting):
   audit-service: 2 → 6 tasks (HPA on CPU > 70%)
-  RabbitMQ queue depth metrics trigger scale-out
+  SQS queue depth metrics trigger scale-out
 ```
 
 ### 8.2 Performance Strategies
@@ -325,7 +325,7 @@ High audit throughput (end of month reporting):
 | `seating-service` | Real-time availability from properly indexed `seat_bookings(booking_date, location_id)` — sub-200ms |
 | `attendance-service` | Nightly sync in bulkhead thread pool; API threads unaffected |
 | `audit-service` | Append-only writes; no UPDATE contention; horizontal scale via consumer group |
-| `notification-service` | Fire-and-forget RabbitMQ consumer; email dispatch async; never blocks producers |
+| `notification-service` | Fire-and-forget SQS consumer; SES email dispatch async; never blocks producers |
 | All services | Paginated list endpoints; no unbounded queries |
 
 ---
@@ -348,13 +348,13 @@ See [security.md](security.md) for full detail.
 | Risk | Impact | Likelihood | Mitigation |
 |---|---|---|---|
 | SSO provider outage | High | Low | Existing sessions continue; no mitigation for new logins |
-| Amazon MQ failure | High | Low | Active/standby HA; services continue; messages drain on recovery |
+| SNS/SQS unavailability | Low | Very Low | AWS-managed 99.9% SLA; messages retained 4 days; no broker to operate |
 | auth-service degraded | Medium | Low | Circuit breaker; cached user context in session |
 | Badge sync failure | Medium | Medium | PagerDuty alert; retry next night; prior data unaffected |
 | Pact contract breaking change | High | Medium | Pact in CI catches before deployment |
 | Cross-location data leak | Critical | Low | `location_id` in all queries; tested in security review |
-| RabbitMQ DLQ accumulation | Medium | Medium | CloudWatch DLQ depth alert; ops runbook for reprocessing |
-| Replay lost (vs Kafka) | Low | N/A | Mitigated by durable queues; audit-service runs 2 HA tasks |
+| SQS DLQ accumulation | Medium | Medium | CloudWatch `ApproximateNumberOfMessagesVisible` alarm; ops runbook for reprocessing |
+| Replay not available | Low | N/A | Mitigated by SQS 4-day retention; audit-service runs 2 HA tasks |
 
 ---
 
@@ -380,7 +380,7 @@ OMS → Email Provider (notification-service; event-triggered)
        Auth: API key (Secrets Manager)
 
 OMS → Procurement System (inventory-service; Phase 2)
-       Trigger: supply.reorder.triggered RabbitMQ event
+       Trigger: supply.reorder.triggered SNS event → SQS queue
        Protocol: REST API (contract TBD — pending discovery session)
 ```
 
@@ -390,10 +390,10 @@ OMS → Procurement System (inventory-service; Phase 2)
 
 See [cost-analysis.md](cost-analysis.md) for full detail.
 
-**Estimated monthly AWS infrastructure cost: ~$710–970/month**
+**Estimated monthly AWS infrastructure cost: ~$450–690/month**
 
 **Key cost decisions:**
-- RabbitMQ over Kafka: saves ~$2,796/year
+- SNS+SQS over RabbitMQ: saves ~$2,748/year; over Kafka: saves ~$5,556/year
 - ECS Fargate over EKS: saves ~$1,440–3,540/year
 - Service merge 11→8: saves ~$1,440/year (3 fewer RDS instances)
 - **Total technology decisions save: ~$5,676–7,776/year**
@@ -406,9 +406,9 @@ See [cost-analysis.md](cost-analysis.md) for full detail.
 
 | Milestone | Work | Blocker |
 |---|---|---|
-| M1 | Infrastructure: ECS, Amazon MQ, RDS, ALB, Eureka, Gateway, observability | None |
+| M1 | Infrastructure: ECS, SNS/SQS topics+queues, RDS, API Gateway+VPC Link+Lambda Authorizer, Cloud Map, CloudFront, observability | None |
 | M2 | auth-service: SSO, sessions, users, roles, HR sync | SSO JWKS endpoint, Arms API |
-| M3 | audit-service + notification-service: RabbitMQ consumers live | M1 complete |
+| M3 | audit-service + notification-service: SQS consumers live | M1 complete |
 | M4 | attendance-service: badge pipeline, two-pass resolution | Athena schema, M3 |
 | M5 | seating-service: floor plans, booking, no-show release | M4 (consumes no_show events) |
 | M6 | remote-service: requests, approvals, policy engine | M5 (attendance consumes approved) |
@@ -419,7 +419,7 @@ See [cost-analysis.md](cost-analysis.md) for full detail.
 | Level | Tool | Scope |
 |---|---|---|
 | Unit | JUnit 5 + Mockito | Business logic, policy enforcement, event mapping |
-| Integration | Spring Boot Test + TestContainers | Repository queries, RabbitMQ producer/consumer pairs, full API flows |
+| Integration | Spring Boot Test + TestContainers | Repository queries, SNS/SQS producer/consumer pairs, full API flows |
 | Contract | Pact | API contracts between consumer and provider services |
 | Security | MockMvc + role simulation | Every endpoint against every role + location combination |
 | Performance | k6 | Seat availability under concurrency; nightly sync throughput |
@@ -433,7 +433,7 @@ See [observability.md](observability.md) for full detail.
 ```
 Monitor → Prometheus (metrics) + CloudWatch (logs) + Jaeger (traces)
      ↓
-Analyse → error trends, latency outliers, RabbitMQ queue depth, user feedback
+Analyse → error trends, latency outliers, SQS queue depth, user feedback
      ↓
 Prioritise → service-scoped; impact vs effort
      ↓
@@ -448,7 +448,7 @@ Monitor → repeat
 - Badge sync failure → PagerDuty (critical)
 - Service error rate > 1% for 5 min → PagerDuty (critical)
 - Circuit breaker OPEN → PagerDuty (critical)
-- RabbitMQ queue depth > 10,000 → Slack (warning)
+- SQS DLQ depth ≥ 1 → PagerDuty (critical); queue depth > 500 → Slack (warning)
 
 ---
 
@@ -459,32 +459,31 @@ Monitor → repeat
 ```
 Employee opens React SPA
   ↓ HTTPS
-React SPA
-  ↓ REST with session cookie
-Spring Cloud Gateway (port 8080)
-  ↓ validates session via auth-service (Eureka lb://)
-  ↓ generates internal JWT + injects X-User-* headers
-  ↓ routes to target service (lb://service-name)
+Amazon CloudFront (static SPA assets cached; /api/** forwarded)
+  ↓ /api/**
+AWS API Gateway HTTP API
+  ↓ Lambda Authorizer: validates SESSION cookie → auth-service → internal JWT (cached 300s)
+  ↓ routes to target service via VPC Link → Cloud Map DNS (e.g. seating-service.oms.local:8084)
 Service (e.g. seating-service)
-  ↓ validates internal JWT (Spring Security)
+  ↓ validates internal JWT (Spring Security / FastAPI python-jose)
   ↓ role + location check (@PreAuthorize + service layer)
   ↓ business logic
   ↓ parameterised SQL query (PostgreSQL, seating_db)
-  ↓ publishes domain event to oms.seating (RabbitMQ)
-  ↓ publishes audit.event to oms.audit (RabbitMQ)
+  ↓ publishes domain event to SNS topic oms-seating (eventType=booking.created)
+  ↓ publishes audit event to SNS topic oms-audit
   ↓ returns ApiResponse DTO
-Gateway → React SPA → Employee
+API Gateway → CloudFront → React SPA → Employee
 
 In parallel (async, within 2 seconds):
-  RabbitMQ → notification-service → dispatches in-app + email
-  RabbitMQ → audit-service → persists immutable audit record
+  SNS oms-seating → SQS oms-seating-notification-service → notification-service → SES email + in-app
+  SNS oms-audit → SQS oms-audit-events → audit-service → persists immutable audit record
 ```
 
 ### Design Philosophy
 
 **Own your data.** Every service owns its database. No cross-service joins, no shared schemas, no shared credentials. This is the most important structural decision — it is what makes each service independently deployable.
 
-**Publish events, not calls.** notification-service and audit-service are never called directly. Every service that needs to notify or audit publishes a RabbitMQ event and returns immediately. This eliminates a whole class of coupling and failure modes.
+**Publish events, not calls.** notification-service and audit-service are never called directly. Every service publishes to an SNS topic; SNS fans out to the relevant SQS queues; consumers process at their own pace. This eliminates a whole class of coupling and failure modes.
 
 **Verify everything.** Zero Trust means every service validates every caller on every request. Internal JWT, role checks, and location checks are not optional layers — they are the baseline.
 

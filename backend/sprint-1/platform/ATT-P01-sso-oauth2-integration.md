@@ -24,8 +24,7 @@ As the platform, I want to integrate with the organisation's SSO provider via OA
 This is the foundational auth ticket. Nothing else is testable end-to-end until this is in place. The Spring Boot backend acts as the OAuth 2.0 resource server. Token verification happens against the SSO provider's JWKS endpoint — the frontend (React) never inspects or stores the raw JWT.
 
 **API Gateway notes:**
-- **Dev:** Spring Cloud Gateway handles routing and will propagate the session context header to downstream services.
-- **Prod:** AWS API Gateway or Kong will handle TLS termination and route to the Spring Boot app; auth validation logic remains server-side.
+- **All environments:** AWS API Gateway HTTP API handles TLS termination and routes to ECS via VPC Link + Cloud Map. The Lambda Authorizer calls `auth-service /api/v1/auth/validate` on every request, generates an internal JWT (HMAC-SHA256, 300s TTL), and injects user context as request context into downstream services. Auth validation logic remains server-side in `auth-service`.
 
 ---
 

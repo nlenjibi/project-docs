@@ -1,7 +1,7 @@
 # Security Architecture
 ## Office Management System (OMS)
 
-**Version:** 3.0 | Model: Zero Trust | Auth: OAuth 2.0 / OIDC via SSO
+**Version:** 4.0 | Model: Zero Trust | Auth: OAuth 2.0 / OIDC via SSO | Edge: AWS API Gateway + Lambda Authorizer
 
 ---
 
@@ -58,14 +58,17 @@ Layer 5 — Data
 10. SPA sends session cookie on every subsequent request (automatic by browser)
 
 Per request:
-11. SPA request → API Gateway
-12. Gateway extracts session cookie → calls auth-service /api/v1/auth/validate
-13. auth-service returns UserContext { userId, roles[], locationIds[] } or 401
-14. Gateway injects X-User-Id, X-User-Roles, X-Location-Ids headers
-15. Gateway generates internal JWT signed with INTERNAL_JWT_SECRET
-16. Gateway forwards to downstream service with internal JWT in Authorization header
-17. Service validates internal JWT via Spring Security @oauth2ResourceServer
-18. Service performs role + location check
+11. SPA request → CloudFront → API Gateway
+12. API Gateway invokes Lambda Authorizer (Python 3.12)
+13. Lambda Authorizer extracts SESSION cookie from request headers
+14. Lambda Authorizer calls auth-service /api/v1/auth/validate (HTTP GET, X-Session-Token header)
+15. auth-service returns UserContext { userId, roles[], locationIds[] } or 401
+16. Lambda Authorizer generates internal JWT (HMAC-SHA256, 300s TTL) with user context
+17. Lambda Authorizer returns IAM ALLOW policy + context { userId, roles, locationIds, correlationId, internalJwt }
+18. API Gateway caches authorizer result for 300s (same session token → no Lambda invocation)
+19. API Gateway injects context as request headers; forwards internal JWT as Authorization: Bearer
+20. Service validates internal JWT (Spring Security / FastAPI python-jose)
+21. Service performs role + location check
 ```
 
 ---
@@ -125,6 +128,27 @@ public class SecurityConfig {
 }
 ```
 
+```python
+# FastAPI services — internal JWT validation
+from jose import jwt, JWTError
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPBearer
+
+bearer = HTTPBearer()
+
+async def get_current_user(token: str = Depends(bearer)) -> UserContext:
+    try:
+        payload = jwt.decode(token.credentials, settings.INTERNAL_JWT_SECRET, algorithms=["HS256"])
+        return UserContext(
+            user_id=UUID(payload["sub"]),
+            roles=[Role(r) for r in payload["roles"]],
+            location_ids=[UUID(lid) for lid in payload.get("locationIds", [])],
+            correlation_id=payload.get("correlationId"),
+        )
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid internal JWT")
+```
+
 ---
 
 ## 5. Role-Based Access Control (RBAC)
@@ -158,7 +182,7 @@ public ResponseEntity<Page<AttendanceRecordDto>> getTeamAttendance(
 }
 ```
 
-The API Gateway applies coarse filtering (is the user authenticated?). Each service performs the **authoritative** role + location check.
+The Lambda Authorizer applies coarse filtering (is the user authenticated?). Each service performs the **authoritative** role + location check.
 
 ---
 
@@ -186,8 +210,7 @@ Never stored in:   Source code, Docker images, YAML files, git history
 
 Secrets per service:
   DB_PASSWORD            → oms/{service}/db-password
-  RABBITMQ_PASSWORD      → oms/rabbitmq/password
-  INTERNAL_JWT_SECRET    → oms/internal-jwt-secret
+  INTERNAL_JWT_SECRET    → oms/internal-jwt-secret  (Lambda Authorizer fetches at cold start, not ECS env var)
   SSO_CLIENT_SECRET      → oms/sso/client-secret  (auth-service only)
   EMAIL_API_KEY          → oms/email/api-key       (notification-service only)
 ```
@@ -213,16 +236,19 @@ GRANT INSERT ON audit_logs TO audit_app;
 ## 7. Network Security
 
 ```
-Public internet  →  AWS ALB (port 443 only)  →  Spring Cloud Gateway
-                                                   (private subnet, port 8080)
-                                                         ↓
-                                               ECS Services (private subnets)
-                                                         ↓
-                                          RDS / Amazon MQ (private subnets)
-                                          No public access to any of these
+Public internet  →  Amazon CloudFront (port 443)
+                         ↓ /api/**
+                    AWS API Gateway HTTP API
+                    + Lambda Authorizer
+                    + VPC Link
+                         ↓
+                   ECS Services (private subnets)
+                         ↓
+                  RDS (private subnets)
+                  No public access to any of these
 
 VPC Flow Logs: enabled (stored in S3, retained 90 days)
-AWS WAF: attached to ALB (OWASP Core Rule Set enabled)
+AWS WAF: attached to API Gateway (OWASP Core Rule Set enabled)
 ```
 
 ---
@@ -231,7 +257,7 @@ AWS WAF: attached to ALB (OWASP Core Rule Set enabled)
 
 | Risk | OMS Mitigation |
 |---|---|
-| A01 Broken Access Control | Role + location check in every service via `@PreAuthorize` + service-layer authorisation; API Gateway coarse filter |
+| A01 Broken Access Control | Role + location check in every service; Lambda Authorizer coarse filter (authenticated?) |
 | A02 Cryptographic Failures | TLS 1.3 in transit; RDS encryption at rest (KMS); HTTP-only cookies; no plaintext secrets |
 | A03 Injection | Parameterised queries mandatory; `@Valid` DTO validation on all inputs; Checkstyle enforces in CI |
 | A04 Insecure Design | ADRs document every security decision; Zero Trust mandated; threat modelling in architecture review |
@@ -264,6 +290,6 @@ AWS WAF: attached to ALB (OWASP Core Rule Set enabled)
 | Token storage | No tokens in localStorage or sessionStorage — HTTP-only cookie managed by browser |
 | XSS | React JSX escapes output by default; `dangerouslySetInnerHTML` is forbidden without security review |
 | CSRF | `SameSite=Strict` cookie prevents cross-site form submissions |
-| Content Security Policy | `Content-Security-Policy` header configured at ALB/gateway |
+| Content Security Policy | `Content-Security-Policy` header configured at CloudFront / API Gateway |
 | Sensitive data in logs | React error boundaries catch and log errors — no user data logged to console in production |
 | Dependencies | `npm audit` run in CI pipeline; `dependabot` configured for automatic PRs |
