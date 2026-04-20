@@ -6,8 +6,8 @@ erDiagram
   %% SECTION 1 — GEOGRAPHIC & LOCATION HIERARCHY
   %% ══════════════════════════════════════════════════════
 
-  COUNTRY {
-    uuid country_id PK
+  ORGANISATION {
+    uuid organisation_id PK
     string country_name
     string country_code
     string timezone
@@ -15,9 +15,9 @@ erDiagram
     timestamp updated_at
   }
 
-  CITY {
-    uuid city_id PK
-    uuid country_id FK
+  OFFICE {
+    uuid office_id PK
+    uuid organisation_id FK
     string city_name
     timestamp created_at
     timestamp updated_at
@@ -25,7 +25,7 @@ erDiagram
 
   OFFICE_BUILDING {
     uuid building_id PK
-    uuid city_id FK
+    uuid office_id FK
     string building_name
     string address
     int total_floors
@@ -650,8 +650,8 @@ erDiagram
   %% ══════════════════════════════════════════════════════
 
   %% ── Location Hierarchy ───────────────────────────────
-  COUNTRY ||--|{ CITY : has
-  CITY ||--|{ OFFICE_BUILDING : has
+  ORGANISATION ||--|{ OFFICE : has
+  OFFICE ||--|{ OFFICE_BUILDING : has
   OFFICE_BUILDING ||--|| LOCATION_CONFIG : configured_by
   OFFICE_BUILDING ||--|{ FLOOR : has
   FLOOR ||--|{ ROOM : contains
