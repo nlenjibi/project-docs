@@ -7,7 +7,7 @@
 | **Type** | Story |
 | **Priority** | 🔴 Highest |
 | **Story Points** | 2 |
-| **Sprint** | Sprint 1 |
+| **Sprint** | Sprint 3 |
 | **Labels** | attendance, config, admin, fastapi |
 | **Service** | `attendance-service` (FastAPI / Python 3.12) |
 
