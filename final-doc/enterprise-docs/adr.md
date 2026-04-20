@@ -1,7 +1,7 @@
 # Architecture Decision Records (ADR)
 ## Office Management System (OMS)
 
-**Version:** 3.0  
+**Version:** 4.0  
 **Status:** Active  
 **Last Updated:** April 2026  
 
@@ -116,9 +116,11 @@ Every major architectural choice is documented here. Format per record:
 
 ---
 
-## ADR-005 — Service Discovery: Netflix Eureka over AWS Cloud Map
+## ADR-005 — Service Discovery: Netflix Eureka → AWS Cloud Map (v4.0 reversal)
 
 **Options Considered:** Netflix Eureka (Spring Cloud), AWS Cloud Map, Kubernetes DNS (rejected with EKS), hardcoded ALB per service
+
+### Previous Decision (v3.0): Netflix Eureka
 
 **Decision:** Netflix Eureka
 
@@ -134,11 +136,25 @@ Every major architectural choice is documented here. Format per record:
 
 **Consequences:** Every service runs a Eureka client. Spring Cloud Gateway resolves all routes via Eureka. OpenFeign clients resolve targets via Eureka. No NLBs needed for inter-service communication.
 
+### Revised Decision (v4.0): AWS Cloud Map
+
+**Decision:** AWS Cloud Map
+
+**Rationale:**
+- AWS Cloud Map provides a private DNS namespace (`oms.local`) natively integrated with ECS. When an ECS task starts, the ECS service registration automatically creates an A record (e.g., `attendance-service.oms.local`). Services call each other using env var URLs like `AUTH_SERVICE_URL=http://auth-service.oms.local:8081`. No client library required — no `spring-cloud-starter-netflix-eureka-client` in any service. Cloud Map eliminates Eureka Server as a separately deployed ECS service and saves ~$10/month.
+
+**Trade-offs Accepted:**
+- DNS-level discovery; no built-in circuit breaking (Resilience4j remains). Health check TTL of 10s means a failed task may still be resolvable for up to 10s.
+
+**Consequences:** Remove `spring-cloud-starter-netflix-eureka-client` from all Spring Boot services. Replace `lb://service-name` with `http://service-name.oms.local:PORT` everywhere. FastAPI services use `httpx.AsyncClient(base_url=settings.AUTH_SERVICE_URL)` with Cloud Map DNS.
+
 ---
 
-## ADR-006 — API Gateway: Spring Cloud Gateway over AWS API Gateway and Kong
+## ADR-006 — API Gateway: Spring Cloud Gateway → AWS API Gateway HTTP API + Lambda Authorizer (v4.0 reversal)
 
-**Options Considered:** Spring Cloud Gateway, AWS API Gateway (REST + HTTP API), Kong (self-hosted)
+**Options Considered:** Spring Cloud Gateway, AWS API Gateway (HTTP API), Kong (self-hosted)
+
+### Previous Decision (v3.0): Spring Cloud Gateway
 
 **Decision:** Spring Cloud Gateway
 
@@ -161,13 +177,29 @@ Every major architectural choice is documented here. Format per record:
 
 **Consequences:** Gateway is deployed as an ECS service behind a public ALB. Auth filter, correlation ID filter, and rate-limiting filter are written as Spring `GlobalFilter` implementations.
 
+### Revised Decision (v4.0): AWS API Gateway HTTP API + Lambda Authorizer
+
+**Decision:** AWS API Gateway HTTP API with a Python 3.12 Lambda Authorizer
+
+**Rationale:**
+- The v3.0 objection to AWS API Gateway was Lambda Authorizer cold-start latency. In v4.0 the Authorizer cache TTL is 300 seconds — for a typical 8-hour session, the Lambda is cold-started once per user per workday, making the latency concern negligible
+- AWS API Gateway routes to ECS via a single VPC Link — no NLB per service required. Cloud Map DNS resolves service names inside the private subnet
+- AWS API Gateway HTTP API is ~70% cheaper than REST API, and removes Spring Cloud Gateway from the ECS cluster (saves ~$15/month on gateway tasks + $35/month on the public ALB)
+- The Lambda Authorizer validates the HTTP-only SESSION cookie by calling `auth-service /api/v1/auth/validate`, generates an internal JWT (HMAC-SHA256, 300s TTL), and returns user context in the IAM policy — fully compatible with the existing HTTP-only cookie session model
+- Rate limiting is enforced natively by API Gateway (100 req/s per user, 150 burst) — no Redis/ElastiCache required
+- AWS WAF attaches directly to API Gateway, providing OWASP Core Rule Set protection at the edge
+
+**Trade-offs Accepted:**
+- Lambda cold start (~50–100ms) on first request per 300s cache window — acceptable given ≤1 cold start per user per workday
+- Lambda Authorizer depends on auth-service availability; if auth-service is down, all requests return 401 (fails closed — correct security behaviour)
+
+**Consequences:** Spring Cloud Gateway ECS service and public ALB removed. All incoming traffic flows: CloudFront → API Gateway HTTP API → Lambda Authorizer → VPC Link → ECS (Cloud Map). Rate limiting, CORS, and WAF all managed at the API Gateway level.
+
 ---
 
-## ADR-007 — Message Broker: RabbitMQ (Amazon MQ) over Kafka (AWS MSK) and SQS
+## ADR-007 — Message Broker: RabbitMQ → Amazon SNS + SQS (v4.0 reversal)
 
 **Options Considered:** Apache Kafka via AWS MSK, Amazon SQS + SNS, RabbitMQ via Amazon MQ
-
-**Decision:** RabbitMQ via Amazon MQ (active/standby, `mq.m5.large`)
 
 **Cost comparison:**
 
@@ -175,7 +207,11 @@ Every major architectural choice is documented here. Format per record:
 |---|---|
 | Kafka (MSK, 3-broker m5.large) | ~$463/month |
 | RabbitMQ (Amazon MQ, active/standby) | ~$230/month |
-| SQS (hundreds of employees, ~2,500 msgs/day) | ~$0.09/month |
+| **SNS + SQS** | **~$0.40/month** |
+
+### Previous Decision (v3.0): RabbitMQ via Amazon MQ
+
+**Decision:** RabbitMQ via Amazon MQ (active/standby, `mq.m5.large`)
 
 **Rationale:**
 
@@ -186,16 +222,31 @@ Every major architectural choice is documented here. Format per record:
 - DLQs are built-in and auto-configured by Spring Cloud Stream (`auto-bind-dlq: true`)
 
 *RabbitMQ over SQS:*
-- SQS has no native fan-out — requires SNS + one SQS queue per consumer per event type → 15 SNS topics + 45 SQS queues for OMS event topology
+- SQS has no native fan-out — requires SNS + one SQS queue per consumer per event type
 - SQS has no native Spring Cloud Stream binder — stepping outside the Spring Cloud ecosystem already committed to
 - RabbitMQ Topic Exchange delivers to all bound queues natively: publish once, all consumers receive
 
 **Trade-offs Accepted:**
-- **Replay is not possible.** Once a message is consumed it is gone. Mitigation: `audit-service` runs with 2 HA tasks and durable queues — if it restarts, unprocessed messages wait in the queue
-- Lower throughput ceiling than Kafka (sufficient for OMS; can migrate if scale demands it)
-- Requires Eureka Server and RabbitMQ as additional infrastructure components (vs SQS's zero-infra model)
+- No event replay; lower throughput ceiling than Kafka (acceptable at OMS scale)
+- Requires RabbitMQ as additional managed infrastructure
 
-**Consequences:** All async communication uses Spring Cloud Stream with the RabbitMQ binder. Topic Exchanges per domain. One durable queue per service per exchange. DLQ auto-created for every consumer queue.
+**Consequences:** All async communication uses Spring Cloud Stream with the RabbitMQ binder. Topic Exchanges per domain. DLQ auto-created for every consumer queue.
+
+### Revised Decision (v4.0): Amazon SNS + SQS
+
+**Decision:** Amazon SNS (fan-out) + Amazon SQS (per-consumer queues) with DLQs via Terraform
+
+**Rationale:**
+- The v3.0 objections to SQS were (1) no native fan-out and (2) no Spring Cloud Stream binder. Both are resolved: SNS topics provide native fan-out (publish once → multiple SQS subscriptions via `FilterPolicy` on `eventType` MessageAttribute); polyglot messaging is accepted (Spring Boot uses AWS SDK v2 `SnsClient.publish()` / `@SqsListener`, FastAPI uses `aioboto3`) — no Spring Cloud Stream binder needed
+- SNS+SQS is ~575× cheaper than RabbitMQ at OMS volumes (~$0.40/month vs ~$230/month = **~$2,748/year saving**)
+- SQS DLQs configured via Terraform `RedrivePolicy` (maxReceiveCount=3) — equivalent to RabbitMQ `auto-bind-dlq: true`
+- Zero additional infrastructure: no broker to deploy, patch, or scale — SNS and SQS are fully managed AWS services
+
+**Trade-offs Accepted:**
+- No event replay (SQS is not a log — consumed messages are gone). Mitigation: immutable `audit-service` log covers all business events
+- Polyglot messaging: Spring Boot uses AWS SDK v2, FastAPI uses aioboto3 — two code patterns to maintain
+
+**Consequences:** All async communication uses SNS topics per domain (`oms-user`, `oms-attendance`, `oms-seating`, `oms-remote`, `oms-inventory`, `oms-audit`) with one SQS queue per consumer. Amazon MQ (RabbitMQ) removed entirely. DLQ depth monitored via CloudWatch alarm → PagerDuty.
 
 ---
 
@@ -271,7 +322,7 @@ Every major architectural choice is documented here. Format per record:
 **Rationale:**
 - An orchestration saga requires a central coordinator service that knows the state of every step. This coordinator is a single point of failure and becomes a bottleneck for all multi-service workflows
 - Choreography keeps each service autonomous — it reacts to events it cares about without any central coordinator knowing about it
-- OMS's supply request workflow (PENDING_MANAGER → PENDING_FACILITIES → FULFILLED) flows naturally as a chain of Kafka events where each step publishes the next event
+- OMS's supply request workflow (PENDING_MANAGER → PENDING_FACILITIES → FULFILLED) flows naturally as a chain of SNS/SQS events where each step publishes the next event
 
 **Trade-offs Accepted:**
 - Harder to visualise the overall workflow — requires tracing correlation IDs across multiple service logs
@@ -298,7 +349,7 @@ Every major architectural choice is documented here. Format per record:
 - Jaeger must be deployed and operated (Docker container in dev, ECS task in production)
 - No AWS-native tracing integration (X-Ray service map, X-Ray insights)
 
-**Consequences:** Every service includes `opentelemetry-spring-boot-starter`. `X-Correlation-ID` is generated at the gateway and propagated via HTTP headers and RabbitMQ message headers to all downstream calls.
+**Consequences:** Every service includes `opentelemetry-spring-boot-starter` (Spring Boot) or `opentelemetry-sdk` + `FastAPIInstrumentor` (FastAPI). `X-Correlation-ID` is generated by the Lambda Authorizer and propagated via HTTP headers and SNS/SQS message body fields to all downstream calls.
 
 ---
 
@@ -319,7 +370,7 @@ Every major architectural choice is documented here. Format per record:
 - CSRF protection required (mitigated by `SameSite=Strict` cookie attribute)
 - `auth-service` becomes a dependency on every request — mitigated by circuit breaker
 
-**Consequences:** The React frontend never handles tokens directly. All auth state is managed server-side. The `SameSite=Strict` cookie attribute prevents CSRF. The Spring Cloud Gateway auth filter extracts the cookie and calls `auth-service` before every routed request.
+**Consequences:** The React frontend never handles tokens directly. All auth state is managed server-side. The `SameSite=Strict` cookie attribute prevents CSRF. The Lambda Authorizer extracts the session cookie and calls `auth-service /api/v1/auth/validate` before every routed request; results are cached for 300s by API Gateway.
 
 ---
 
@@ -327,18 +378,18 @@ Every major architectural choice is documented here. Format per record:
 
 **Options Considered:** Direct REST calls to notification/audit services, event-driven via RabbitMQ
 
-**Decision:** Event-driven via RabbitMQ — notification and audit services are never called directly by REST
+**Decision:** Event-driven via Amazon SNS + SQS — notification and audit services are never called directly by REST
 
 **Rationale:**
 - If notification and audit were called directly, every business service would need to handle their availability — circuit breakers, retries, fallbacks for non-critical operations
-- With event-driven dispatch, a business operation (e.g., booking a seat) publishes an event and returns immediately — it does not wait for notification delivery or audit persistence
+- With event-driven dispatch, a business operation (e.g., booking a seat) publishes an SNS event and returns immediately — it does not wait for notification delivery or audit persistence
 - `audit-service`'s INSERT-only database user model requires that write access is restricted to the consumer — no REST endpoint can write audit records directly
 
 **Trade-offs Accepted:**
 - Audit records are written slightly after the fact (async) — there is a small window where an action has occurred but is not yet in the audit log
 - Notification delivery failures require DLQ monitoring rather than REST error responses
 
-**Consequences:** `notification-service` and `audit-service` expose no write APIs. They subscribe to RabbitMQ queues. All business services publish events; they never import or depend on notification or audit service interfaces.
+**Consequences:** `notification-service` and `audit-service` expose no write APIs. They consume from SQS queues (Spring `@SqsListener` or FastAPI `aioboto3` poll loop). All business services publish to SNS topics; they never import or depend on notification or audit service interfaces.
 
 ---
 
@@ -349,7 +400,7 @@ Every major architectural choice is documented here. Format per record:
 **Decision:** `processed_events` deduplication table in every consumer
 
 **Rationale:**
-- RabbitMQ guarantees at-least-once delivery — duplicate messages can arrive after a consumer crash before acknowledgment
+- SQS guarantees at-least-once delivery — duplicate messages can arrive after a consumer crash before deletion (visibility timeout expiry)
 - Every business event carries a UUID `eventId` — checking for this UUID before processing is simple and reliable
 - The check is wrapped in the same database transaction as the business operation — deduplication is atomic
 
@@ -357,7 +408,7 @@ Every major architectural choice is documented here. Format per record:
 - `processed_events` table grows over time — requires periodic cleanup of old records
 - Adds one SELECT per consumed message (negligible at OMS scale)
 
-**Consequences:** Every `@Bean Consumer<Event>` in every service checks `processedEventRepository.existsById(event.getEventId())` before processing. If found, the message is acknowledged and ignored.
+**Consequences:** Every SQS message handler (Spring `@SqsListener` or FastAPI `aioboto3` poll loop) checks `processedEventRepository.existsById(event.getEventId())` before processing. If found, the message is deleted from the queue and ignored.
 
 ---
 
@@ -408,7 +459,7 @@ Every major architectural choice is documented here. Format per record:
 
 **Rationale:**
 - 12-Factor App principle: configuration in the environment, not code
-- Secrets (DB passwords, JWT signing key, RabbitMQ credentials) are stored in AWS Secrets Manager and injected as environment variables at task startup — never in source control
+- Secrets (DB passwords, JWT signing key, SSO client secret, SES API key) are stored in AWS Secrets Manager and injected as environment variables at task startup — never in source control
 - Non-secret config (CRON schedules, thresholds, timeouts) is managed in ECS Task Definition environment variables — visible in the AWS console, auditable via CloudTrail
 - Avoids running a Config Server as another dependency
 
@@ -429,7 +480,7 @@ Every major architectural choice is documented here. Format per record:
 **Rationale:**
 - Full integration environments for 8 services are expensive to maintain and slow to spin up in CI
 - Pact allows each consumer service to define a contract (what it expects from a provider) and each provider to verify that contract independently — no shared environment required
-- TestContainers provides real PostgreSQL and RabbitMQ instances for integration tests — no mocking of infrastructure
+- TestContainers provides real PostgreSQL instances for integration tests; SQS/SNS interactions use `localstack` container or AWS SDK mocking (no mocking of the database layer)
 
 **Trade-offs Accepted:**
 - Pact tests require careful setup — consumers write contracts, providers must run contract verifications in their CI pipeline
@@ -458,6 +509,49 @@ Every major architectural choice is documented here. Format per record:
 
 ---
 
+## ADR-021 — CI/CD Pipeline: Jenkins over GitHub Actions
+
+**Options Considered:** GitHub Actions, Jenkins (self-hosted), AWS CodePipeline, GitLab CI
+
+**Decision:** Jenkins (self-hosted, running in Docker on the CI host)
+
+**Rationale:**
+- The OMS codebase is hosted in a private corporate git repository, not GitHub — GitHub Actions is not available
+- Jenkins is the organisation's existing standard CI/CD tooling — the team already has a Jenkins instance, shared credentials, and operational knowledge
+- Declarative Jenkinsfile (Groovy) provides fine-grained control over pipeline stages without proprietary YAML syntax
+- Jenkins ECR push and ECS deploy steps use the same AWS CLI and ECS update-service commands that would be used in any other CI system — no vendor lock-in in the pipeline logic itself
+- Pipeline stages align with the v4.0 quality gates: Lint → Unit Test → Integration Test (TestContainers) → OWASP Dependency Check → Docker Build → Push ECR → Deploy ECS (rolling update)
+
+**Trade-offs Accepted:**
+- Jenkins requires a dedicated host to run — operational overhead vs GitHub Actions' hosted runners
+- Jenkinsfile syntax (Groovy) is less ergonomic than GitHub Actions YAML for simple cases
+- Jenkins plugins must be kept up to date (security maintenance burden)
+
+**Pipeline stages per service:**
+
+```groovy
+pipeline {
+  agent any
+  environment {
+    ECR_REPO = "ACCOUNT.dkr.ecr.eu-west-1.amazonaws.com/oms-${SERVICE_NAME}"
+    ECS_CLUSTER = "oms-production"
+    ECS_SERVICE = "oms-${SERVICE_NAME}-service"
+  }
+  stages {
+    stage('Lint')         { steps { sh 'mvn checkstyle:check' } }      // or: flake8 / ruff
+    stage('Test')         { steps { sh 'mvn verify' } }                // TestContainers integration tests
+    stage('OWASP')        { steps { sh 'mvn dependency-check:check' } }
+    stage('Docker Build') { steps { sh 'docker build -t $ECR_REPO:$BUILD_NUMBER .' } }
+    stage('Push ECR')     { steps { sh 'docker push $ECR_REPO:$BUILD_NUMBER' } }
+    stage('Deploy ECS')   { steps { sh 'aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment' } }
+  }
+}
+```
+
+**Consequences:** One `Jenkinsfile` per service in the repository root. The Jenkins shared library provides ECR authentication and ECS rolling deploy steps as reusable functions. OWASP Dependency Check fails the build on CVSS >= 7. Docker images are tagged with the Jenkins `BUILD_NUMBER` and pushed to ECR before ECS deployment.
+
+---
+
 ## Summary Table
 
 | ADR | Decision | Key Trade-off |
@@ -466,19 +560,20 @@ Every major architectural choice is documented here. Format per record:
 | 002 | Microservices | Distributed complexity accepted |
 | 003 | 8 services (merged from 11) | Larger merged codebases |
 | 004 | ECS Fargate | No Istio — app-level mTLS instead |
-| 005 | Netflix Eureka | Eureka Server is another service to run |
-| 006 | Spring Cloud Gateway | Requires Java filter code and Redis for rate limiting |
-| 007 | RabbitMQ (Amazon MQ) | No event replay (vs Kafka) |
+| 005 | ~~Netflix Eureka~~ → **AWS Cloud Map (v4.0)** | DNS-level discovery; no built-in circuit breaking |
+| 006 | ~~Spring Cloud Gateway~~ → **AWS API Gateway HTTP API + Lambda Authorizer (v4.0)** | 300s cache TTL mitigates cold-start concern |
+| 007 | ~~RabbitMQ~~ → **Amazon SNS + SQS (v4.0)** | No event replay; polyglot messaging patterns |
 | 008 | REST not GraphQL | Dashboard composition via BFF endpoint |
 | 009 | PostgreSQL per service | 8 RDS instances, no cross-service joins |
-| 010 | Zero Trust — internal JWT | No Istio; manual cert rotation |
-| 011 | Choreography Saga | Harder to visualise full workflow |
+| 010 | Zero Trust — internal JWT | No Istio; shared signing key rotation |
+| 011 | Choreography Saga (SNS/SQS events) | Harder to visualise full workflow |
 | 012 | OpenTelemetry + Jaeger | Jaeger must be deployed and operated |
-| 013 | HTTP-only session cookie | CSRF protection required; validate on every request |
-| 014 | Notification/audit event-driven only | Audit is slightly async after the fact |
+| 013 | HTTP-only session cookie | CSRF protection required; Lambda Authorizer validates every request |
+| 014 | Notification/audit event-driven (SNS/SQS) | Audit is slightly async after the fact |
 | 015 | processed_events deduplication | Table grows; needs periodic cleanup |
 | 016 | Nightly badge sync | T+1 attendance data |
 | 017 | Real-time seat availability | No cache; DB must be properly indexed |
 | 018 | Env vars + Secrets Manager | Config change requires redeployment |
-| 019 | Pact contract testing | Pact infrastructure required in CI |
+| 019 | Pact contract testing + TestContainers | Pact infrastructure required in CI |
 | 020 | Location-scoped RBAC | Every auth check needs role + location |
+| 021 | Jenkins CI/CD | Self-hosted Jenkins operational overhead |

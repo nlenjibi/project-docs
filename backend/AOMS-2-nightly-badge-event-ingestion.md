@@ -1,5 +1,7 @@
 # AOMS-2 — Nightly Badge Event Ingestion (Backend)
 
+> **DEPRECATED (v4.0):** This ticket documents the original Spring Boot implementation. The canonical FastAPI implementation is in [backend/attendance-service/AOMS-2-nightly-badge-event-ingestion.md](attendance-service/AOMS-2-nightly-badge-event-ingestion.md).
+
 | Field | Value |
 |-------|-------|
 | **Ticket** | AOMS-2 |

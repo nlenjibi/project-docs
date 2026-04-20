@@ -24,8 +24,7 @@ As the platform, I want a global interceptor that enforces the per-location role
 The OMS uses a **role-per-location** model — a user may be a Manager in Accra but only an Employee in Lagos. This interceptor enforces both the role check AND the location check on every protected endpoint. It runs as a `HandlerInterceptor` (or `@PreAuthorize` via AOP) applied globally — not per-controller. No endpoint should be manually checking roles; all role/location logic lives here.
 
 **API Gateway notes:**
-- **Dev:** Spring Cloud Gateway validates the session (calls `/api/v1/auth/validate`) and injects `X-User-Id` and `X-Location-Id` request headers before routing to the service. The interceptor reads these headers — it does not re-verify the token.
-- **Prod:** AWS API Gateway or Kong performs the same header injection after validating the session.
+- **All environments:** AWS API Gateway Lambda Authorizer validates the session cookie by calling `auth-service /api/v1/auth/validate`, generates an internal JWT with user context (userId, roles[], locationIds[]), and injects `X-User-Id`, `X-User-Roles`, `X-Location-Ids` request context headers before routing to the service. The interceptor reads these headers — it does not re-verify the token or call auth-service again.
 
 ---
 

@@ -1,5 +1,7 @@
 # AOMS-7 — Manager Team Attendance View (Backend)
 
+> **DEPRECATED (v4.0):** This ticket documents the original Spring Boot implementation. The canonical FastAPI implementation is in [backend/attendance-service/AOMS-7-manager-team-attendance-view.md](attendance-service/AOMS-7-manager-team-attendance-view.md).
+
 | Field | Value |
 |-------|-------|
 | **Ticket** | AOMS-7 |

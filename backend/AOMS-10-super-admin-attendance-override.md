@@ -1,5 +1,7 @@
 # AOMS-10 — Super Admin Attendance Override (Backend)
 
+> **DEPRECATED (v4.0):** This ticket documents the original Spring Boot implementation. The canonical FastAPI implementation is in [backend/attendance-service/AOMS-10-super-admin-attendance-override.md](attendance-service/AOMS-10-super-admin-attendance-override.md).
+
 | Field | Value |
 |-------|-------|
 | **Ticket** | AOMS-10 |

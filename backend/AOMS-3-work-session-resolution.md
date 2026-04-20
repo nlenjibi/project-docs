@@ -1,5 +1,7 @@
 # AOMS-3 — Work Session Resolution (Backend)
 
+> **DEPRECATED (v4.0):** This ticket documents the original Spring Boot implementation. The canonical FastAPI implementation is in [backend/attendance-service/AOMS-3-work-session-resolution.md](attendance-service/AOMS-3-work-session-resolution.md).
+
 | Field | Value |
 |-------|-------|
 | **Ticket** | AOMS-3 |

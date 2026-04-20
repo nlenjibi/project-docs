@@ -1,5 +1,7 @@
 # AOMS-11 — Public Holiday Management (Backend)
 
+> **DEPRECATED (v4.0):** This ticket documents the original Spring Boot implementation. The canonical FastAPI implementation is in [backend/attendance-service/AOMS-11-public-holiday-management.md](attendance-service/AOMS-11-public-holiday-management.md).
+
 | Field | Value |
 |-------|-------|
 | **Ticket** | AOMS-11 |

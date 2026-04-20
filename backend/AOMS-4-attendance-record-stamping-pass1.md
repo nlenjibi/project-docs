@@ -1,5 +1,7 @@
 # AOMS-4 — Attendance Record Stamping — Pass 1: Badge Events (Backend)
 
+> **DEPRECATED (v4.0):** This ticket documents the original Spring Boot implementation. The canonical FastAPI implementation is in [backend/attendance-service/AOMS-4-attendance-record-stamping-pass1.md](attendance-service/AOMS-4-attendance-record-stamping-pass1.md).
+
 | Field | Value |
 |-------|-------|
 | **Ticket** | AOMS-4 |
