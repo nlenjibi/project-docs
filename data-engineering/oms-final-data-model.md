@@ -144,10 +144,12 @@ erDiagram
     uuid employee_id FK
     uuid building_id FK
     date session_date
+
     timestamp first_badge_in
     timestamp last_badge_out
     int total_duration_minutes
     bool is_late
+    int session_split_count
     int minutes_late
     bool crosses_midnight
     timestamp created_at
