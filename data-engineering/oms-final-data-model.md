@@ -150,6 +150,7 @@ erDiagram
     int total_duration_minutes
     bool is_late
     int session_split_count
+    int session_split_index
     int minutes_late
     bool crosses_midnight
     timestamp created_at
