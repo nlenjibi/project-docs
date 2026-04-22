@@ -176,6 +176,7 @@ erDiagram
     uuid id PK
     uuid user_id FK
     uuid building_id FK
+    uuid office_id FK 
     date record_date
     enum status
     uuid work_session_id FK
