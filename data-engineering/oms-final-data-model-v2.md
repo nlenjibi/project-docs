@@ -144,8 +144,12 @@ erDiagram
     uuid user_id FK
     uuid building_id FK
     string personnel_id
+    string office_id 
     enum event_type
     timestamp occurred_at
+    date occurred_date 
+    bool is_resolved 
+    timestamp job_run_id 
     jsonb raw_payload
     timestamp ingested_at
   }
@@ -154,6 +158,7 @@ erDiagram
     uuid id PK
     uuid user_id FK
     uuid building_id FK
+    uuid office_id
     date session_date
     timestamp first_badge_in
     timestamp last_badge_out
